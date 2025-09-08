@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head><title>Test Boostly Calls</title></head>
+<body>
+  <h1>Test Boostly AI Caller</h1>
+  <input id="phone" placeholder="+1234567890" value="">
+  <input id="name" placeholder="Name" value="Test">
+  <input id="company" placeholder="Company" value="Test Restaurant">
+  <button onclick="makeCall()">Call Now</button>
+  <div id="result"></div>
+  
+  <script>
+    async function makeCall() {
+      const response = await fetch('https://boostly-ai-sdr.onrender.com/make-call', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          to: document.getElementById('phone').value,
+          name: document.getElementById('name').value,
+          company: document.getElementById('company').value
+        })
+      });
+      const result = await response.json();
+      document.getElementById('result').innerHTML = result.message;
+    }
+  </script>
+</body>
+</html>
