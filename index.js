@@ -159,7 +159,7 @@ fastify.post('/call-status', async (request, reply) => {
     reply.send({ received: true });
 });
 
-// WebSocket for media streaming
+// WebSocket for media streaming - FIXED VERSION
 fastify.register(async (fastify) => {
     fastify.get('/media-stream', { websocket: true }, (connection, req) => {
         const callId = req.query.callId;
@@ -167,8 +167,8 @@ fastify.register(async (fastify) => {
         
         console.log(`Connected to ${leadData?.name} at ${leadData?.company}`);
         
-        // Connect to OpenAI
-        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
+        // Connect to OpenAI with correct model
+        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17', {
             headers: {
                 Authorization: `Bearer ${OPENAI_API_KEY}`,
                 "OpenAI-Beta": "realtime=v1"
@@ -240,6 +240,9 @@ Remember: You're Kora, not a generic AI. Be personable and build rapport!`;
                     instructions: systemMessage,
                     modalities: ["text", "audio"],
                     temperature: 0.8,
+                    input_audio_transcription: {
+                        model: 'whisper-1'
+                    }
                 }
             };
             
@@ -253,22 +256,43 @@ Remember: You're Kora, not a generic AI. Be personable and build rapport!`;
             setTimeout(sendSessionUpdate, 250);
         });
         
-        // Handle OpenAI responses
+        // Handle OpenAI responses - FIXED AUDIO HANDLING
         openAiWs.on('message', (data) => {
             try {
                 const response = JSON.parse(data);
                 
+                // Log response types for debugging
+                if (response.type === 'session.created' || response.type === 'session.updated') {
+                    console.log('Session event:', response.type);
+                }
+                
+                if (response.type === 'error') {
+                    console.error('OpenAI Error:', response.error);
+                }
+                
+                // Handle audio data
                 if (response.type === 'response.audio.delta' && response.delta) {
                     const audioDelta = {
                         event: 'media',
                         streamSid: streamSid,
-                        media: { payload: response.delta }
+                        media: { 
+                            payload: response.delta
+                        }
                     };
                     connection.send(JSON.stringify(audioDelta));
                 }
                 
-                if (response.type === 'error') {
-                    console.error('OpenAI Error:', response);
+                // Log transcriptions for debugging
+                if (response.type === 'conversation.item.created' && response.item?.role === 'assistant') {
+                    console.log('AI is speaking...');
+                }
+                
+                if (response.type === 'input_audio_buffer.speech_started') {
+                    console.log('Caller started speaking...');
+                }
+                
+                if (response.type === 'input_audio_buffer.speech_stopped') {
+                    console.log('Caller stopped speaking...');
                 }
                 
             } catch (error) {
@@ -276,13 +300,14 @@ Remember: You're Kora, not a generic AI. Be personable and build rapport!`;
             }
         });
         
-        // Handle incoming audio from Twilio
+        // Handle incoming audio from Twilio - FIXED
         connection.on('message', (message) => {
             try {
                 const data = JSON.parse(message);
                 
                 switch (data.event) {
                     case 'media':
+                        // Forward audio to OpenAI
                         if (openAiWs.readyState === WebSocket.OPEN) {
                             const audioAppend = {
                                 type: 'input_audio_buffer.append',
@@ -295,6 +320,11 @@ Remember: You're Kora, not a generic AI. Be personable and build rapport!`;
                     case 'start':
                         streamSid = data.start.streamSid;
                         console.log('Call started, stream ID:', streamSid);
+                        console.log('Call details:', data.start);
+                        break;
+                        
+                    case 'stop':
+                        console.log('Call media stream stopped');
                         break;
                 }
             } catch (error) {
