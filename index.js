@@ -25,7 +25,7 @@ const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-// Enable CORS - THIS FIXES THE CONNECTION ERROR
+// Enable CORS
 fastify.register(fastifyCors, {
     origin: true,
     credentials: true
@@ -159,7 +159,7 @@ fastify.post('/call-status', async (request, reply) => {
     reply.send({ received: true });
 });
 
-// WebSocket for media streaming - FIXED VERSION
+// WebSocket for media streaming - COMPLETE AUDIO FIX
 fastify.register(async (fastify) => {
     fastify.get('/media-stream', { websocket: true }, (connection, req) => {
         const callId = req.query.callId;
@@ -167,7 +167,7 @@ fastify.register(async (fastify) => {
         
         console.log(`Connected to ${leadData?.name} at ${leadData?.company}`);
         
-        // Connect to OpenAI with correct model
+        // Connect to OpenAI Realtime API
         const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17', {
             headers: {
                 Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -177,9 +177,16 @@ fastify.register(async (fastify) => {
         
         let streamSid = null;
         
-        // Create Kora's personality and instructions
-        const sendSessionUpdate = () => {
-            const systemMessage = `You are Kora, Boostly's AI Marketing Assistant. You're calling ${leadData?.name} from ${leadData?.company} who recently filled out a form on Facebook about Boostly's restaurant marketing services.
+        // OpenAI WebSocket opened
+        openAiWs.on('open', () => {
+            console.log('Connected to OpenAI Realtime API');
+            
+            // Send session configuration
+            const sessionUpdate = {
+                type: 'session.update',
+                session: {
+                    modalities: ['text', 'audio'],
+                    instructions: `You are Kora, Boostly's AI Marketing Assistant. You're calling ${leadData?.name} from ${leadData?.company} who recently filled out a form on Facebook about Boostly's restaurant marketing services.
 
 PERSONALITY:
 - Be chill, casual, and friendly but professional
@@ -205,94 +212,90 @@ CONVERSATION FLOW:
 - "Is it just the one location or are there multiple?"
 - "Are you currently doing any marketing? What types?"
 
-3. OBJECTION HANDLING (use MEDDIC):
+3. OBJECTION HANDLING:
 - If "too busy": "I totally get it! This'll just take 2 minutes and could really help boost your revenue. When would be a better time?"
-- If "not interested": "No worries! Can I ask what made you fill out the form initially? Maybe something changed?"
-- If "already have marketing": "That's great! A lot of our clients use us alongside other marketing. What are you currently using? We might complement it well."
+- If "not interested": "No worries! Can I ask what made you fill out the form initially?"
 - If price comes up: "Yeah, I'd love to show you that on a demo! Pricing varies based on your needs."
 
 4. BOOKING THE DEMO:
-If qualified (owner + can be at computer):
-"Awesome! I'd love to show you exactly how Boostly can help ${leadData?.company}. What works better for you - tomorrow afternoon or [day after] morning? I have slots at [give 2-3 specific times]."
+If qualified: "Awesome! I'd love to show you exactly how Boostly can help ${leadData?.company}. What works better for you - tomorrow afternoon or the day after morning?"
 
 5. WRAP UP:
 - If booked: "Perfect! I'll send a calendar invite to confirm. You'll love what we can do for ${leadData?.company}. Talk soon!"
-- If not qualified: "No problem! When the owner is available, have them visit Boostly.com or email support@boostly.com. Thanks for your time!"
+- If not qualified: "No problem! When the owner is available, have them visit Boostly.com or email support@boostly.com."
 
-IMPORTANT RULES:
-- Keep the call between 2.5-5 minutes
-- Always try to book for next day or day after
-- Give specific time options, don't leave it open-ended
-- Be persistent but respectful with objections
-- If they ask technical details: "Great question! That's exactly what we'll cover in the demo."
-- Website: Boostly.com
-- Email: support@boostly.com
-
-Remember: You're Kora, not a generic AI. Be personable and build rapport!`;
-
-            const sessionUpdate = {
-                type: 'session.update',
-                session: {
-                    turn_detection: { type: 'server_vad' },
+Remember: You're Kora, not a generic AI. Be personable and build rapport!`,
+                    voice: VOICE,
                     input_audio_format: 'g711_ulaw',
                     output_audio_format: 'g711_ulaw',
-                    voice: VOICE,
-                    instructions: systemMessage,
-                    modalities: ["text", "audio"],
-                    temperature: 0.8,
                     input_audio_transcription: {
                         model: 'whisper-1'
-                    }
+                    },
+                    turn_detection: {
+                        type: 'server_vad',
+                        threshold: 0.5,
+                        prefix_padding_ms: 300,
+                        silence_duration_ms: 200
+                    },
+                    tools: []
                 }
             };
             
-            console.log('Sending session configuration to OpenAI...');
+            console.log('Sending session update to OpenAI');
             openAiWs.send(JSON.stringify(sessionUpdate));
-        };
-        
-        // OpenAI WebSocket opened
-        openAiWs.on('open', () => {
-            console.log('Connected to OpenAI Realtime API');
-            setTimeout(sendSessionUpdate, 250);
+            
+            // Send initial response item to start conversation
+            setTimeout(() => {
+                const responseCreate = {
+                    type: 'response.create',
+                    response: {
+                        modalities: ['text', 'audio'],
+                        instructions: 'Please greet the user and start the conversation.'
+                    }
+                };
+                openAiWs.send(JSON.stringify(responseCreate));
+            }, 500);
         });
         
-        // Handle OpenAI responses - FIXED AUDIO HANDLING
+        // Handle OpenAI messages
         openAiWs.on('message', (data) => {
             try {
                 const response = JSON.parse(data);
                 
-                // Log response types for debugging
-                if (response.type === 'session.created' || response.type === 'session.updated') {
-                    console.log('Session event:', response.type);
-                }
+                // Log different message types for debugging
+                console.log('OpenAI event:', response.type);
                 
                 if (response.type === 'error') {
-                    console.error('OpenAI Error:', response.error);
+                    console.error('OpenAI error:', response.error);
+                    return;
                 }
                 
-                // Handle audio data
-                if (response.type === 'response.audio.delta' && response.delta) {
-                    const audioDelta = {
-                        event: 'media',
-                        streamSid: streamSid,
-                        media: { 
-                            payload: response.delta
-                        }
-                    };
-                    connection.send(JSON.stringify(audioDelta));
+                // Handle audio delta
+                if (response.type === 'response.audio.delta') {
+                    if (response.delta) {
+                        const audioMessage = {
+                            event: 'media',
+                            streamSid: streamSid,
+                            media: {
+                                payload: response.delta
+                            }
+                        };
+                        connection.send(JSON.stringify(audioMessage));
+                    }
                 }
                 
-                // Log transcriptions for debugging
-                if (response.type === 'conversation.item.created' && response.item?.role === 'assistant') {
-                    console.log('AI is speaking...');
+                // Handle response completion
+                if (response.type === 'response.done') {
+                    console.log('AI finished speaking');
                 }
                 
-                if (response.type === 'input_audio_buffer.speech_started') {
-                    console.log('Caller started speaking...');
+                // Handle transcripts
+                if (response.type === 'response.audio_transcript.done') {
+                    console.log('AI said:', response.transcript);
                 }
                 
-                if (response.type === 'input_audio_buffer.speech_stopped') {
-                    console.log('Caller stopped speaking...');
+                if (response.type === 'conversation.item.input_audio_transcription.completed') {
+                    console.log('Caller said:', response.transcript);
                 }
                 
             } catch (error) {
@@ -300,50 +303,45 @@ Remember: You're Kora, not a generic AI. Be personable and build rapport!`;
             }
         });
         
-        // Handle incoming audio from Twilio - FIXED
+        // Handle incoming messages from Twilio
         connection.on('message', (message) => {
             try {
                 const data = JSON.parse(message);
                 
-                switch (data.event) {
-                    case 'media':
-                        // Forward audio to OpenAI
-                        if (openAiWs.readyState === WebSocket.OPEN) {
-                            const audioAppend = {
-                                type: 'input_audio_buffer.append',
-                                audio: data.media.payload
-                            };
-                            openAiWs.send(JSON.stringify(audioAppend));
-                        }
-                        break;
-                        
-                    case 'start':
-                        streamSid = data.start.streamSid;
-                        console.log('Call started, stream ID:', streamSid);
-                        console.log('Call details:', data.start);
-                        break;
-                        
-                    case 'stop':
-                        console.log('Call media stream stopped');
-                        break;
+                if (data.event === 'start') {
+                    streamSid = data.start.streamSid;
+                    console.log('Twilio stream started:', streamSid);
+                } else if (data.event === 'media') {
+                    // Send audio to OpenAI
+                    if (openAiWs.readyState === WebSocket.OPEN) {
+                        const audioMessage = {
+                            type: 'input_audio_buffer.append',
+                            audio: data.media.payload
+                        };
+                        openAiWs.send(JSON.stringify(audioMessage));
+                    }
+                } else if (data.event === 'stop') {
+                    console.log('Twilio stream stopped');
                 }
             } catch (error) {
-                console.error('Error parsing Twilio message:', error);
+                console.error('Error processing Twilio message:', error);
             }
         });
         
-        // Handle disconnection
+        // Handle connection close
         connection.on('close', () => {
+            console.log('Twilio connection closed');
             if (openAiWs.readyState === WebSocket.OPEN) {
                 openAiWs.close();
             }
-            console.log(`Call with ${leadData?.name} ended`);
         });
         
+        // Handle OpenAI close
         openAiWs.on('close', () => {
-            console.log('Disconnected from OpenAI');
+            console.log('OpenAI connection closed');
         });
         
+        // Handle errors
         openAiWs.on('error', (error) => {
             console.error('OpenAI WebSocket error:', error);
         });
