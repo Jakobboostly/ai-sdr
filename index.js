@@ -3,6 +3,7 @@ import WebSocket from 'ws';
 import dotenv from 'dotenv';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
+import fastifyCors from '@fastify/cors';
 import twilio from 'twilio';
 
 // Load environment variables
@@ -23,6 +24,12 @@ const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
+
+// Enable CORS - THIS FIXES THE CONNECTION ERROR
+fastify.register(fastifyCors, {
+    origin: true,
+    credentials: true
+});
 
 // Constants
 const VOICE = 'alloy';
@@ -82,7 +89,7 @@ fastify.post('/make-call', async (request, reply) => {
             statusCallbackEvent: ['answered', 'completed', 'no-answer', 'busy'],
             machineDetection: 'DetectMessageEnd',
             asyncAmd: true,
-            timeout: 30 // Hang up if no answer after 30 seconds
+            timeout: 30
         });
         
         // Update attempts
@@ -97,7 +104,7 @@ fastify.post('/make-call', async (request, reply) => {
         
     } catch (error) {
         console.error('Error making call:', error);
-        reply.status(500).send({ error: 'Failed to initiate call' });
+        reply.status(500).send({ error: 'Failed to initiate call: ' + error.message });
     }
 });
 
@@ -138,18 +145,15 @@ fastify.post('/call-status', async (request, reply) => {
     console.log(`Call to ${leadData?.name} (${To}): ${CallStatus}`);
     
     if (CallStatus === 'completed' || CallStatus === 'no-answer' || CallStatus === 'busy') {
-        // Log the outcome
         console.log(`Call Result - Name: ${leadData?.name}, Company: ${leadData?.company}, Status: ${CallStatus}, Duration: ${CallDuration}s`);
         
-        // If no answer and this was first attempt, schedule retry
         if ((CallStatus === 'no-answer' || CallStatus === 'busy') && leadData?.attemptNumber === 1) {
             console.log(`Will retry ${leadData?.name} later (attempt 2 of 2)`);
         }
         
-        // Clean up session data after call ends
         setTimeout(() => {
             activeCallSessions.delete(callId);
-        }, 60000); // Keep for 1 minute for debugging
+        }, 60000);
     }
     
     reply.send({ received: true });
@@ -255,7 +259,6 @@ Remember: You're Kora, not a generic AI. Be personable and build rapport!`;
                 const response = JSON.parse(data);
                 
                 if (response.type === 'response.audio.delta' && response.delta) {
-                    // Send audio back to Twilio
                     const audioDelta = {
                         event: 'media',
                         streamSid: streamSid,
@@ -280,7 +283,6 @@ Remember: You're Kora, not a generic AI. Be personable and build rapport!`;
                 
                 switch (data.event) {
                     case 'media':
-                        // Forward audio to OpenAI
                         if (openAiWs.readyState === WebSocket.OPEN) {
                             const audioAppend = {
                                 type: 'input_audio_buffer.append',
