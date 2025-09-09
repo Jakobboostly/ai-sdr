@@ -20,12 +20,12 @@ const {
   TWILIO_PHONE_NUMBER,
   PUBLIC_BASE_URL,
   PORT = 10000,
-  VOICE = 'sol',                 // preferred voice
+  VOICE = 'coral',              // ✅ default voice: coral
   TWILIO_VALIDATE_SIGNATURE = 'true',
   LOG_LEVEL = 'info',
 } = process.env;
 
-const FALLBACK_VOICE = 'alloy';  // fallback if sol isn’t available
+const FALLBACK_VOICE = 'alloy'; // fallback if coral isn’t available
 
 const REQUIRED = {
   OPENAI_API_KEY,
@@ -45,7 +45,7 @@ if (missing.length) {
   process.exit(1);
 }
 
-const SAMPLE_RATE_HZ = 8000; // Twilio Media Streams are 8k μ-law
+const SAMPLE_RATE_HZ = 8000; // Twilio Media Streams are 8k μ-law (kept for reference)
 const MAX_CALL_SECONDS = 170;
 const OPENAI_REALTIME_URL =
   `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`;
@@ -175,10 +175,10 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
     oaWs.send(JSON.stringify({
       type: 'session.update',
       session: {
-        // Realtime expects this exact combo if you want audio
+        // Realtime requires this combo for audio
         modalities: ['audio', 'text'],
-        voice: voiceChoice,                // may be rejected -> we handle in onmessage
-        input_audio_format: 'g711_ulaw',   // strings, not objects
+        voice: voiceChoice,            // may be rejected -> we retry with alloy
+        input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         turn_detection: {
           type: 'server_vad',
@@ -226,8 +226,8 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
     if (event.type === 'error') {
       jlog('error', 'OpenAI error', { detail: event.error });
       // If the chosen voice isn’t allowed, retry once with alloy
-      if (event.error?.param === 'session.voice' && VOICE === 'sol') {
-        jlog('warn', 'Retrying with alloy voice');
+      if (event.error?.param === 'session.voice' && VOICE !== FALLBACK_VOICE) {
+        jlog('warn', `Voice '${VOICE}' unavailable — retrying with '${FALLBACK_VOICE}'`);
         sendSessionUpdate(FALLBACK_VOICE);
       }
       return;
@@ -263,5 +263,5 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
  * ============================ */
 fastify.listen({ port: Number(PORT), host: '0.0.0.0' }, (err, address) => {
   if (err) { jlog('error', 'Failed to start', { err }); process.exit(1); }
-  jlog('info', 'Server listening', { address, model: OPENAI_REALTIME_MODEL });
+  jlog('info', 'Server listening', { address, model: OPENAI_REALTIME_MODEL, voice: VOICE, fallback: FALLBACK_VOICE });
 });
