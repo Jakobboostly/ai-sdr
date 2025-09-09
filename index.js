@@ -98,7 +98,7 @@ fastify.post('/call-status', async (request, reply) => {
   reply.send({ received: true });
 });
 
-// WebSocket - CRITICAL FIX HERE
+// WebSocket handler - FIXED
 fastify.get('/media-stream', { websocket: true }, (connection, req) => {
   const { callId } = req.query || {};
   const lead = activeCallSessions.get(callId);
@@ -161,7 +161,8 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
       
       if (event.type === 'response.audio.delta' && event.delta) {
         if (streamSid) {
-          connection.send(JSON.stringify({
+          // FIXED: Use connection.socket.send()
+          connection.socket.send(JSON.stringify({
             event: 'media',
             streamSid: streamSid,
             media: { payload: event.delta }
@@ -182,7 +183,7 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
     }
   });
   
-  // CRITICAL: Handle Twilio messages properly
+  // FIXED: Handle Twilio messages on connection.socket
   connection.socket.on('message', (message) => {
     try {
       const msg = JSON.parse(message.toString());
@@ -195,7 +196,7 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
         if (pendingAudio.length > 0) {
           console.log(`Sending ${pendingAudio.length} buffered frames`);
           pendingAudio.forEach(delta => {
-            connection.send(JSON.stringify({
+            connection.socket.send(JSON.stringify({
               event: 'media',
               streamSid: streamSid,
               media: { payload: delta }
