@@ -14,14 +14,14 @@ dotenv.config();
  * ============================ */
 const {
   OPENAI_API_KEY,
-  OPENAI_REALTIME_MODEL = 'gpt-realtime-2025-08-28', // <- your requested default
+  OPENAI_REALTIME_MODEL = 'gpt-realtime-2025-08-28', // default to your requested model
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_PHONE_NUMBER,
   PUBLIC_BASE_URL,
   PORT = 10000,
   VOICE = 'sol',
-  TWILIO_VALIDATE_SIGNATURE = 'true', // <- default on
+  TWILIO_VALIDATE_SIGNATURE = 'true', // default ON
   LOG_LEVEL = 'info', // debug | info | warn | error
 } = process.env;
 
@@ -32,7 +32,7 @@ const REQUIRED = {
   TWILIO_PHONE_NUMBER,
   PUBLIC_BASE_URL,
 };
-const missing = Object.entries(REQUIRED).filter(([,v]) => !v).map(([k]) => k);
+const missing = Object.entries(REQUIRED).filter(([, v]) => !v).map(([k]) => k);
 if (missing.length) {
   console.error(JSON.stringify({
     ts: new Date().toISOString(),
@@ -52,7 +52,7 @@ const OPENAI_REALTIME_URL =
  * Lightweight JSON logger
  * ============================ */
 const LEVELS = ['debug', 'info', 'warn', 'error'];
-function shouldLog(level){ return LEVELS.indexOf(level) >= LEVELS.indexOf(LOG_LEVEL); }
+function shouldLog(level) { return LEVELS.indexOf(level) >= LEVELS.indexOf(LOG_LEVEL); }
 function jlog(level, msg, extra = {}) {
   if (!shouldLog(level)) return;
   const line = { ts: new Date().toISOString(), level, msg, ...extra };
@@ -91,6 +91,7 @@ fastify.setErrorHandler((error, request, reply) => {
  * ============================ */
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const activeCallSessions = new Map(); // callId -> { name, company, to, callSid }
+
 function generateCallId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2);
 }
@@ -112,7 +113,7 @@ function validateTwilioSignature(request) {
     const signature = request.headers['x-twilio-signature'];
     if (!signature) return false;
 
-    // Twilio signs the full URL used for the webhook (including query string).
+    // Twilio signs the full URL (including query string).
     const fullUrl = `${PUBLIC_BASE_URL}${request.raw.url}`;
     const params = request.method === 'POST' ? (request.body || {}) : {};
     const ok = twilio.validateRequest(TWILIO_AUTH_TOKEN, signature, fullUrl, params);
@@ -251,7 +252,7 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
         oaWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
         jlog('debug', 'Committed input audio buffer due to silence');
       }
-    }, 600); // pairs nicely with server_vad
+    }, 600); // pairs well with server_vad
   }
 
   async function softEndCall() {
@@ -260,6 +261,7 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
         oaWs.send(JSON.stringify({
           type: 'response.create',
           response: {
+            modalities: ['audio'],
             instructions:
               "I'm going to let you run—I'll text over a quick summary and a link to pick a time that works. Thanks for the chat!",
           },
@@ -290,10 +292,20 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
 
     const opener = `Hey ${lead?.name || 'there'}! This is Kora from Boostly. You recently inquired about marketing services for ${lead?.company || 'your restaurant'}. Got a quick minute to chat?`;
 
-    // Configure session
+    // Configure session (FIXED: voice + input/output formats)
     oaWs.send(JSON.stringify({
       type: 'session.update',
       session: {
+        modalities: ['text', 'audio'],
+        voice: VOICE,
+        input_audio_format:  { type: 'g711_ulaw', sample_rate_hz: SAMPLE_RATE_HZ },
+        output_audio_format: { type: 'g711_ulaw', sample_rate_hz: SAMPLE_RATE_HZ },
+        turn_detection: {
+          type: 'server_vad',
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 500,
+        },
         instructions: [
           `You are Kora from Boostly, an AI marketing assistant.`,
           `You're calling ${lead?.name || 'a lead'} from ${lead?.company || 'their restaurant'} who filled out a form about restaurant marketing services.`,
@@ -301,21 +313,15 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
           `Ask about their current marketing (channels, budget, goals) and pain points.`,
           `Keep the call under ~3 minutes; if they’re busy, offer to schedule a follow-up.`,
         ].join(' '),
-        audio: {
-          input:  { format: 'g711_ulaw', sample_rate_hz: SAMPLE_RATE_HZ },
-          output: { format: 'g711_ulaw', sample_rate_hz: SAMPLE_RATE_HZ, voice: VOICE },
-        },
-        turn_detection: {
-          type: 'server_vad',
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 500,
-        },
       },
     }));
 
-    // Initial greeting
-    oaWs.send(JSON.stringify({ type: 'response.create', response: { instructions: opener } }));
+    // Initial greeting (ensure audio response)
+    oaWs.send(JSON.stringify({
+      type: 'response.create',
+      response: { modalities: ['audio'], instructions: opener },
+    }));
+
     callSoftEndTimer = setTimeout(softEndCall, MAX_CALL_SECONDS * 1000);
   });
 
@@ -327,7 +333,7 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
     if (event.type === 'session.updated') jlog('debug', 'OpenAI session.updated');
     if (event.type === 'error') jlog('error', 'OpenAI error', { detail: event.error });
 
-    // Stream audio back to Twilio
+    // Stream AI audio back to Twilio
     if (event.type === 'response.audio.delta' && event.delta && streamSid) {
       connection.send(JSON.stringify({
         event: 'media',
@@ -376,7 +382,7 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
         }
         break;
       case 'mark':
-        // optional: markers if you need them
+        // optional markers
         break;
       case 'stop':
         jlog('info', 'Twilio stream stopped');
@@ -408,5 +414,9 @@ fastify.listen({ port: Number(PORT), host: '0.0.0.0' }, (err, address) => {
     jlog('error', 'Fastify failed to start', { err });
     process.exit(1);
   }
-  jlog('info', 'Server listening', { address, model: OPENAI_REALTIME_MODEL, validateSignatures: isSigValidationOn() });
+  jlog('info', 'Server listening', {
+    address,
+    model: OPENAI_REALTIME_MODEL,
+    validateSignatures: isSigValidationOn(),
+  });
 });
