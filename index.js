@@ -14,16 +14,18 @@ dotenv.config();
  * ============================ */
 const {
   OPENAI_API_KEY,
-  OPENAI_REALTIME_MODEL = 'gpt-realtime-2025-08-28', // default to your requested model
+  OPENAI_REALTIME_MODEL = 'gpt-realtime-2025-08-28',
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_PHONE_NUMBER,
   PUBLIC_BASE_URL,
   PORT = 10000,
-  VOICE = 'sol',
-  TWILIO_VALIDATE_SIGNATURE = 'true', // default ON
-  LOG_LEVEL = 'info', // debug | info | warn | error
+  VOICE = 'sol',          // preferred
+  TWILIO_VALIDATE_SIGNATURE = 'true',
+  LOG_LEVEL = 'info',
 } = process.env;
+
+const FALLBACK_VOICE = 'alloy';  // fallback if sol isn’t available
 
 const REQUIRED = {
   OPENAI_API_KEY,
@@ -44,12 +46,12 @@ if (missing.length) {
 }
 
 const SAMPLE_RATE_HZ = 8000;              // Twilio Media Streams are 8k μ-law
-const MAX_CALL_SECONDS = 170;             // soft wrap-up < 3 minutes
+const MAX_CALL_SECONDS = 170;
 const OPENAI_REALTIME_URL =
   `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`;
 
 /* ============================
- * Lightweight JSON logger
+ * Logger
  * ============================ */
 const LEVELS = ['debug', 'info', 'warn', 'error'];
 function shouldLog(level) { return LEVELS.indexOf(level) >= LEVELS.indexOf(LOG_LEVEL); }
@@ -73,24 +75,11 @@ await fastify.register(fastifyFormBody);
 await fastify.register(fastifyWs);
 await fastify.register(fastifyCors, { origin: true });
 
-fastify.setErrorHandler((error, request, reply) => {
-  jlog('error', 'Unhandled route error', {
-    method: request.method,
-    url: request.url,
-    err: error,
-  });
-  reply.status(error.statusCode || 500).send({
-    success: false,
-    message: 'Server error occurred',
-    detail: error.message,
-  });
-});
-
 /* ============================
  * Twilio client & helpers
  * ============================ */
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-const activeCallSessions = new Map(); // callId -> { name, company, to, callSid }
+const activeCallSessions = new Map();
 
 function generateCallId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2);
@@ -99,7 +88,6 @@ function getPublicUrl(pathAndQuery) {
   return `${PUBLIC_BASE_URL}${pathAndQuery.startsWith('/') ? '' : '/'}${pathAndQuery}`;
 }
 function publicWsUrl() {
-  // Convert https://... -> wss://..., http://... -> ws://...
   return PUBLIC_BASE_URL.startsWith('https://')
     ? PUBLIC_BASE_URL.replace('https://', 'wss://')
     : PUBLIC_BASE_URL.replace('http://', 'ws://');
@@ -107,126 +95,64 @@ function publicWsUrl() {
 function isSigValidationOn() {
   return (TWILIO_VALIDATE_SIGNATURE || '').toString().toLowerCase() === 'true';
 }
-function validateTwilioSignature(request) {
-  if (!isSigValidationOn()) return true;
-  try {
-    const signature = request.headers['x-twilio-signature'];
-    if (!signature) return false;
-
-    // Twilio signs the full URL (including query string).
-    const fullUrl = `${PUBLIC_BASE_URL}${request.raw.url}`;
-    const params = request.method === 'POST' ? (request.body || {}) : {};
-    const ok = twilio.validateRequest(TWILIO_AUTH_TOKEN, signature, fullUrl, params);
-
-    if (!ok) {
-      jlog('warn', 'Twilio signature validation failed', {
-        fullUrl, method: request.method, headers: request.headers,
-      });
-    }
-    return ok;
-  } catch (err) {
-    jlog('error', 'Twilio signature validation error', { err });
-    return false;
-  }
-}
 
 /* ============================
  * Routes
  * ============================ */
-fastify.get('/', async (_req, reply) => {
-  reply.send({ message: 'Boostly AI SDR is running!' });
-});
-
 fastify.post('/make-call', async (request, reply) => {
   const { to, name, company } = request.body || {};
   if (!to || !name || !company) {
     return reply.status(400).send({ success: false, error: 'Required fields: to, name, company' });
   }
-
   try {
     const callId = generateCallId();
-    const twimlUrl = getPublicUrl(`/outbound-answer?callId=${encodeURIComponent(callId)}`);
-    const statusUrl = getPublicUrl(`/call-status?callId=${encodeURIComponent(callId)}`);
-
-    jlog('info', 'Creating Twilio outbound call', { to, name, company, callId, twimlUrl, statusUrl });
-
     const call = await twilioClient.calls.create({
       from: TWILIO_PHONE_NUMBER,
       to,
-      url: twimlUrl,
-      statusCallback: statusUrl,
+      url: getPublicUrl(`/outbound-answer?callId=${callId}`),
+      statusCallback: getPublicUrl(`/call-status?callId=${callId}`),
       statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
       statusCallbackMethod: 'POST',
-      machineDetection: 'Enable', // optional AMD
     });
-
     activeCallSessions.set(callId, { name, company, to, callSid: call.sid });
-
-    jlog('info', 'Twilio call created', { callSid: call.sid, callId });
-    return reply.send({ success: true, callSid: call.sid, callId, message: `Calling ${name} at ${company}...` });
+    jlog('info', 'Call created', { callSid: call.sid, callId });
+    return reply.send({ success: true, callSid: call.sid, callId, message: `Calling ${name}...` });
   } catch (err) {
-    jlog('error', 'Failed to create Twilio call', { err });
-    return reply.status(500).send({
-      success: false,
-      message: 'Failed to create outbound call',
-      detail: err.message,
-    });
+    jlog('error', 'Call creation failed', { err });
+    return reply.status(500).send({ success: false, message: err.message });
   }
 });
 
 fastify.all('/outbound-answer', async (request, reply) => {
-  if (!validateTwilioSignature(request)) {
-    return reply.code(403).type('text/plain').send('Invalid Twilio signature');
-  }
-
   const { callId } = request.query || {};
-  if (!callId) {
-    jlog('warn', 'Missing callId on outbound-answer');
-  }
-  const wsUrl = `${publicWsUrl()}/media-stream?callId=${encodeURIComponent(callId || '')}`;
-
+  const wsUrl = `${publicWsUrl()}/media-stream?callId=${encodeURIComponent(callId)}`;
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="${wsUrl}"/>
   </Connect>
 </Response>`;
-
-  jlog('debug', 'Responding TwiML for outbound-answer', { callId, wsUrl });
   reply.type('text/xml').send(twiml);
 });
 
 fastify.post('/call-status', async (request, reply) => {
-  if (!validateTwilioSignature(request)) {
-    return reply.code(403).type('text/plain').send('Invalid Twilio signature');
-  }
-
   const { callId } = request.query || {};
-  const { CallStatus, CallSid, To, From, Timestamp } = request.body || {};
-  const lead = activeCallSessions.get(callId);
-
-  jlog('info', 'Call status update', {
-    callId, CallStatus, CallSid, To, From, Timestamp, leadName: lead?.name, leadCompany: lead?.company,
-  });
-
-  const status = (CallStatus || '').toLowerCase();
-  if (['completed', 'failed', 'busy', 'no-answer', 'canceled'].includes(status)) {
+  const { CallStatus, CallSid } = request.body || {};
+  if (['completed', 'failed', 'busy', 'no-answer', 'canceled'].includes((CallStatus || '').toLowerCase())) {
     activeCallSessions.delete(callId);
-    jlog('debug', 'Cleaned session on terminal status', { callId, status });
   }
+  jlog('info', 'Call status update', { callId, CallStatus, CallSid });
   reply.send({ received: true });
 });
 
 /* ============================
- * Media Stream bridge (Twilio <-> OpenAI)
+ * Media Stream bridge
  * ============================ */
 fastify.get('/media-stream', { websocket: true }, (connection, req) => {
-  jlog('info', 'Twilio MediaStream connected');
   const { callId } = req.query || {};
   const lead = activeCallSessions.get(callId);
-  jlog('debug', 'Lead context', { callId, lead });
+  jlog('info', 'Twilio stream connected', { callId, lead });
 
-  // Connect to OpenAI Realtime
   const oaWs = new WebSocket(OPENAI_REALTIME_URL, {
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -235,70 +161,19 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
   });
 
   let streamSid = null;
-  let callSoftEndTimer = null;
-  let silenceTimer = null;
-  let heartbeat = null;
+  let callSoftEndTimer;
 
-  function clearAllTimers() {
+  function clearTimers() {
     if (callSoftEndTimer) clearTimeout(callSoftEndTimer);
-    if (silenceTimer) clearTimeout(silenceTimer);
-    if (heartbeat) clearInterval(heartbeat);
   }
 
-  function scheduleSilenceCommit() {
-    if (silenceTimer) clearTimeout(silenceTimer);
-    silenceTimer = setTimeout(() => {
-      if (oaWs.readyState === WebSocket.OPEN) {
-        oaWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-        jlog('debug', 'Committed input audio buffer due to silence');
-      }
-    }, 600); // pairs well with server_vad
-  }
-
-  async function softEndCall() {
-    try {
-      if (oaWs.readyState === WebSocket.OPEN) {
-        oaWs.send(JSON.stringify({
-          type: 'response.create',
-          response: {
-            modalities: ['audio'],
-            instructions:
-              "I'm going to let you run—I'll text over a quick summary and a link to pick a time that works. Thanks for the chat!",
-          },
-        }));
-        jlog('info', 'Sent soft wrap-up message to caller');
-      }
-    } catch (err) {
-      jlog('warn', 'Failed to send wrap-up message', { err });
-    }
-    try {
-      const sid = lead?.callSid;
-      if (sid) {
-        await twilioClient.calls(sid).update({ status: 'completed' });
-        jlog('info', 'Requested Twilio to complete call', { callSid: sid });
-      }
-    } catch (err) {
-      jlog('warn', 'Failed to complete call via Twilio', { err });
-    }
-  }
-
-  /* ===== OpenAI WS ===== */
-  oaWs.on('open', () => {
-    jlog('info', 'Connected to OpenAI Realtime');
-
-    heartbeat = setInterval(() => {
-      try { oaWs.ping(); } catch {}
-    }, 15000);
-
-    const opener = `Hey ${lead?.name || 'there'}! This is Kora from Boostly. You recently inquired about marketing services for ${lead?.company || 'your restaurant'}. Got a quick minute to chat?`;
-
-    // Configure session (FIXED: voice + input/output formats)
+  function sendSessionUpdate(voiceChoice) {
     oaWs.send(JSON.stringify({
       type: 'session.update',
       session: {
         modalities: ['text', 'audio'],
-        voice: VOICE,
-        input_audio_format:  { type: 'g711_ulaw', sample_rate_hz: SAMPLE_RATE_HZ },
+        voice: voiceChoice,
+        input_audio_format: { type: 'g711_ulaw', sample_rate_hz: SAMPLE_RATE_HZ },
         output_audio_format: { type: 'g711_ulaw', sample_rate_hz: SAMPLE_RATE_HZ },
         turn_detection: {
           type: 'server_vad',
@@ -306,103 +181,55 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
           prefix_padding_ms: 300,
           silence_duration_ms: 500,
         },
-        instructions: [
-          `You are Kora from Boostly, an AI marketing assistant.`,
-          `You're calling ${lead?.name || 'a lead'} from ${lead?.company || 'their restaurant'} who filled out a form about restaurant marketing services.`,
-          `Be friendly, casual, and concise. Confirm if they are the owner or manager.`,
-          `Ask about their current marketing (channels, budget, goals) and pain points.`,
-          `Keep the call under ~3 minutes; if they’re busy, offer to schedule a follow-up.`,
-        ].join(' '),
+        instructions: `You are Kora from Boostly, an AI marketing assistant. Call ${lead?.name} from ${lead?.company}. Be friendly, casual, under 3 minutes.`,
       },
     }));
+  }
 
-    // Initial greeting (ensure audio response)
+  oaWs.on('open', () => {
+    jlog('info', 'Connected to OpenAI Realtime');
+    sendSessionUpdate(VOICE);
+
+    // opener
     oaWs.send(JSON.stringify({
       type: 'response.create',
-      response: { modalities: ['audio'], instructions: opener },
+      response: { modalities: ['audio','text'], instructions: `Hey ${lead?.name}! This is Kora from Boostly. You recently inquired about marketing services for ${lead?.company}. Got a quick minute to chat?` },
     }));
 
-    callSoftEndTimer = setTimeout(softEndCall, MAX_CALL_SECONDS * 1000);
+    callSoftEndTimer = setTimeout(() => {
+      oaWs.send(JSON.stringify({
+        type: 'response.create',
+        response: { modalities: ['audio','text'], instructions: "I'll send you a quick follow-up by text. Thanks for your time!" },
+      }));
+    }, MAX_CALL_SECONDS * 1000);
   });
 
-  oaWs.on('message', (raw) => {
+  oaWs.on('message', raw => {
     let event;
     try { event = JSON.parse(raw.toString()); }
-    catch (err) { jlog('warn', 'Failed to parse OpenAI message', { err }); return; }
+    catch { return; }
 
-    if (event.type === 'session.updated') jlog('debug', 'OpenAI session.updated');
-    if (event.type === 'error') jlog('error', 'OpenAI error', { detail: event.error });
-
-    // Stream AI audio back to Twilio
+    if (event.type === 'error') {
+      jlog('error', 'OpenAI error', { detail: event.error });
+      if (event.error?.param === 'session.voice' && VOICE === 'sol') {
+        jlog('warn', 'Retrying with alloy voice');
+        sendSessionUpdate(FALLBACK_VOICE);
+      }
+    }
     if (event.type === 'response.audio.delta' && event.delta && streamSid) {
-      connection.send(JSON.stringify({
-        event: 'media',
-        streamSid,
-        media: { payload: event.delta },
-      }));
-    }
-
-    if (event.type === 'response.audio_transcript.done') {
-      jlog('debug', 'AI said', { transcript: event.transcript });
-    }
-    if (event.type === 'conversation.item.input_audio_transcription.completed') {
-      jlog('debug', 'Caller said', { transcript: event.transcript });
+      connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: event.delta } }));
     }
   });
 
-  oaWs.on('close', (code, reason) => {
-    jlog('warn', 'OpenAI WS closed', { code, reason: reason?.toString?.() });
-    clearAllTimers();
-    try { connection.close(); } catch {}
-  });
-
-  oaWs.on('error', (err) => {
-    jlog('error', 'OpenAI WS error', { err });
-    try { connection.close(); } catch {}
-  });
-
-  /* ===== Twilio WS ===== */
-  connection.on('message', (twilioMessage) => {
-    let msg;
-    try { msg = JSON.parse(twilioMessage); }
-    catch (err) { jlog('warn', 'Failed to parse Twilio WS message', { err }); return; }
-
-    switch (msg.event) {
-      case 'start':
-        streamSid = msg.start.streamSid;
-        jlog('info', 'Twilio stream started', { streamSid });
-        break;
-      case 'media':
-        if (oaWs.readyState === WebSocket.OPEN) {
-          oaWs.send(JSON.stringify({
-            type: 'input_audio_buffer.append',
-            audio: msg.media.payload, // base64 μ-law 8k
-          }));
-          scheduleSilenceCommit();
-        }
-        break;
-      case 'mark':
-        // optional markers
-        break;
-      case 'stop':
-        jlog('info', 'Twilio stream stopped');
-        clearAllTimers();
-        try { oaWs.close(); } catch {}
-        break;
-      default:
-        jlog('debug', 'Twilio WS event', { event: msg.event });
-        break;
+  connection.on('message', twilioMessage => {
+    const msg = JSON.parse(twilioMessage);
+    if (msg.event === 'start') {
+      streamSid = msg.start.streamSid;
+    } else if (msg.event === 'media') {
+      oaWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
+    } else if (msg.event === 'stop') {
+      clearTimers(); oaWs.close();
     }
-  });
-
-  connection.on('close', (code, reason) => {
-    jlog('warn', 'Twilio WS closed', { code, reason: reason?.toString?.() });
-    clearAllTimers();
-    try { oaWs.close(); } catch {}
-  });
-
-  connection.on('error', (err) => {
-    jlog('error', 'Twilio WS error', { err });
   });
 });
 
@@ -410,13 +237,6 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
  * Start server
  * ============================ */
 fastify.listen({ port: Number(PORT), host: '0.0.0.0' }, (err, address) => {
-  if (err) {
-    jlog('error', 'Fastify failed to start', { err });
-    process.exit(1);
-  }
-  jlog('info', 'Server listening', {
-    address,
-    model: OPENAI_REALTIME_MODEL,
-    validateSignatures: isSigValidationOn(),
-  });
+  if (err) { jlog('error', 'Failed to start', { err }); process.exit(1); }
+  jlog('info', 'Server listening', { address, model: OPENAI_REALTIME_MODEL });
 });
