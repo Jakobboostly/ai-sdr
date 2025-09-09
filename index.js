@@ -99,7 +99,7 @@ function validateTwilioSignature(request) {
   try {
     const signature = request.headers['x-twilio-signature'];
     if (!signature) return false;
-    const fullUrl = `${PUBLIC_BASE_URL}${request.raw.url}`; // includes query
+    const fullUrl = `${PUBLIC_BASE_URL}${request.raw.url}`; // includes path & query
     const params = request.method === 'POST' ? (request.body || {}) : {};
     const ok = twilio.validateRequest(TWILIO_AUTH_TOKEN, signature, fullUrl, params);
     if (!ok) jlog('warn', 'Twilio signature validation failed', { fullUrl });
@@ -146,13 +146,19 @@ fastify.all('/outbound-answer', async (request, reply) => {
     return reply.code(403).type('text/plain').send('Invalid Twilio signature');
   }
   const { callId } = request.query || {};
-  const wsUrl = `${publicWsUrl()}/media-stream?callId=${encodeURIComponent(callId || '')}`;
+  // IMPORTANT: Twilio does NOT support query strings on <Stream url>. Use <Parameter>.
+  // We’ll pass callId as a Parameter below and read it from start.customParameters. :contentReference[oaicite:1]{index=1}
+  const wsUrl = `${publicWsUrl()}/media-stream`;
+
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="${wsUrl}"/>
+    <Stream url="${wsUrl}">
+      <Parameter name="callId" value="${callId || ''}"/>
+    </Stream>
   </Connect>
 </Response>`;
+
   jlog('debug', 'Responding TwiML for outbound-answer', { callId, wsUrl });
   reply.type('text/xml').send(twiml);
 });
@@ -174,10 +180,8 @@ fastify.post('/call-status', async (request, reply) => {
 /* ============================
  * Media Stream bridge (Twilio <-> OpenAI)
  * ============================ */
-fastify.get('/media-stream', { websocket: true }, (connection, req) => {
-  const { callId } = req.query || {};
-  const lead = activeCallSessions.get(callId);
-  jlog('info', 'Twilio stream connected', { callId, lead });
+fastify.get('/media-stream', { websocket: true }, (connection) => {
+  jlog('info', 'Twilio stream connected');
 
   const oaWs = new WebSocket(OPENAI_REALTIME_URL, {
     headers: {
@@ -189,6 +193,7 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
   let streamSid = null;
   let callSoftEndTimer = null;
   let sessionReady = false;
+  let callIdFromTwilio = null;
   const pendingAudio = []; // buffer OA deltas until Twilio streamSid exists
   let twilioMediaFramesIn = 0;
   let oaAudioFramesOut = 0;
@@ -197,13 +202,13 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
     if (callSoftEndTimer) clearTimeout(callSoftEndTimer);
   }
 
-  function sendSessionUpdate(voiceChoice) {
+  function sendSessionUpdate(voiceChoice, lead) {
     oaWs.send(JSON.stringify({
       type: 'session.update',
       session: {
-        modalities: ['audio', 'text'],
+        modalities: ['audio', 'text'],   // required for audio responses
         voice: voiceChoice,               // if rejected -> retry with alloy
-        input_audio_format: 'g711_ulaw',  // Twilio μ-law
+        input_audio_format: 'g711_ulaw',  // μ-law 8k
         output_audio_format: 'g711_ulaw',
         turn_detection: {
           type: 'server_vad',
@@ -224,7 +229,7 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
   // ---------- OpenAI WS ----------
   oaWs.on('open', () => {
     jlog('info', 'Connected to OpenAI Realtime');
-    sendSessionUpdate(VOICE);
+    // We’ll send the session.update once we know the lead from callId (after Twilio start)
   });
 
   oaWs.on('message', (raw) => {
@@ -238,6 +243,7 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
       if (!sessionReady) {
         sessionReady = true;
         jlog('info', 'OpenAI session updated — sending opener');
+        const lead = activeCallSessions.get(callIdFromTwilio);
         const opener = `Hey ${lead?.name || 'there'}! This is Kora from Boostly. You recently inquired about marketing for ${lead?.company || 'your restaurant'}. Got a quick minute to chat?`;
         oaWs.send(JSON.stringify({
           type: 'response.create',
@@ -257,7 +263,8 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
       jlog('error', 'OpenAI error', { detail: evt.error });
       if (evt.error?.param === 'session.voice' && VOICE !== FALLBACK_VOICE) {
         jlog('warn', `Voice '${VOICE}' unavailable — retrying with '${FALLBACK_VOICE}'`);
-        sendSessionUpdate(FALLBACK_VOICE);
+        const lead = activeCallSessions.get(callIdFromTwilio);
+        sendSessionUpdate(FALLBACK_VOICE, lead);
       }
       return;
     }
@@ -293,16 +300,33 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
 
   // ---------- Twilio WS ----------
   connection.on('message', (twilioMessage) => {
-    let raw;
+    let raw, msg;
     try {
       raw = typeof twilioMessage === 'string' ? twilioMessage : twilioMessage.toString('utf8');
-      const msg = JSON.parse(raw);
+      msg = JSON.parse(raw);
+    } catch (err) {
+      jlog('error', 'Failed to parse Twilio WS message', { err, sample: raw ? raw.slice(0, 200) : '<no raw>' });
+      return;
+    }
 
-      if (msg.event === 'start') {
+    switch (msg.event) {
+      case 'connected':
+        jlog('info', 'Twilio WS event: connected');
+        break;
+
+      case 'start': {
         streamSid = msg.start.streamSid;
-        jlog('info', 'Twilio stream started', { streamSid });
+        // Pull our callId from customParameters
+        callIdFromTwilio = msg.start?.customParameters?.callId || null;
+        const lead = activeCallSessions.get(callIdFromTwilio);
+        jlog('info', 'Twilio stream started', { streamSid, callIdFromTwilio, leadFound: !!lead });
 
-        // flush buffered audio from OpenAI
+        // Now that we know the lead, configure OpenAI session
+        if (oaWs.readyState === WebSocket.OPEN) {
+          sendSessionUpdate(VOICE, lead);
+        }
+
+        // flush buffered audio from OpenAI (if any arrived early)
         if (pendingAudio.length) {
           jlog('debug', `Flushing ${pendingAudio.length} buffered audio frames to Twilio`);
           for (const delta of pendingAudio) {
@@ -310,10 +334,10 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
           }
           pendingAudio.length = 0;
         }
-        return;
+        break;
       }
 
-      if (msg.event === 'media') {
+      case 'media':
         twilioMediaFramesIn++;
         if (oaWs.readyState === WebSocket.OPEN) {
           oaWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
@@ -321,25 +345,21 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
         if (twilioMediaFramesIn <= 3 || twilioMediaFramesIn % 100 === 0) {
           jlog('debug', 'Twilio → OA media frame', { twilioMediaFramesIn });
         }
-        return;
-      }
+        break;
 
-      if (msg.event === 'stop') {
+      case 'mark':
+        jlog('debug', 'Twilio mark', { label: msg.mark?.name });
+        break;
+
+      case 'stop':
         jlog('info', 'Twilio stream stopped');
         clearTimers();
         try { oaWs.close(); } catch {}
-        return;
-      }
+        break;
 
-      // other events (mark, etc.)
-      jlog('debug', 'Twilio WS event', { event: msg.event });
-
-    } catch (err) {
-      jlog('error', 'Failed to parse Twilio WS message', {
-        err,
-        sample: raw ? raw.slice(0, 200) : '<no raw>',
-      });
-      return;
+      default:
+        jlog('debug', 'Twilio WS event (other)', { event: msg.event });
+        break;
     }
   });
 
