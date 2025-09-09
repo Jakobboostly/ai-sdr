@@ -20,12 +20,12 @@ const {
   TWILIO_PHONE_NUMBER,
   PUBLIC_BASE_URL,
   PORT = 10000,
-  VOICE = 'coral',              // ✅ default voice: coral
+  VOICE = 'coral',                 // default voice
   TWILIO_VALIDATE_SIGNATURE = 'true',
-  LOG_LEVEL = 'info',
+  LOG_LEVEL = 'info',              // debug | info | warn | error
 } = process.env;
 
-const FALLBACK_VOICE = 'alloy'; // fallback if coral isn’t available
+const FALLBACK_VOICE = 'alloy';    // fallback if coral isn’t available
 
 const REQUIRED = {
   OPENAI_API_KEY,
@@ -45,8 +45,7 @@ if (missing.length) {
   process.exit(1);
 }
 
-const SAMPLE_RATE_HZ = 8000; // Twilio Media Streams are 8k μ-law (kept for reference)
-const MAX_CALL_SECONDS = 170;
+const MAX_CALL_SECONDS = 170; // soft wrap-up < 3 minutes
 const OPENAI_REALTIME_URL =
   `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`;
 
@@ -79,7 +78,7 @@ await fastify.register(fastifyCors, { origin: true });
  * Twilio client & helpers
  * ============================ */
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-const activeCallSessions = new Map();
+const activeCallSessions = new Map(); // callId -> { name, company, to, callSid }
 
 function generateCallId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2);
@@ -94,6 +93,22 @@ function publicWsUrl() {
 }
 function isSigValidationOn() {
   return (TWILIO_VALIDATE_SIGNATURE || '').toString().toLowerCase() === 'true';
+}
+function validateTwilioSignature(request) {
+  if (!isSigValidationOn()) return true;
+  try {
+    const signature = request.headers['x-twilio-signature'];
+    if (!signature) return false;
+    // Twilio signs the full public URL (including query string)
+    const fullUrl = `${PUBLIC_BASE_URL}${request.raw.url}`;
+    const params = request.method === 'POST' ? (request.body || {}) : {};
+    const ok = twilio.validateRequest(TWILIO_AUTH_TOKEN, signature, fullUrl, params);
+    if (!ok) jlog('warn', 'Twilio signature validation failed', { fullUrl });
+    return ok;
+  } catch (err) {
+    jlog('error', 'Twilio signature validation error', { err });
+    return false;
+  }
 }
 
 /* ============================
@@ -128,6 +143,9 @@ fastify.post('/make-call', async (request, reply) => {
 });
 
 fastify.all('/outbound-answer', async (request, reply) => {
+  if (!validateTwilioSignature(request)) {
+    return reply.code(403).type('text/plain').send('Invalid Twilio signature');
+  }
   const { callId } = request.query || {};
   const wsUrl = `${publicWsUrl()}/media-stream?callId=${encodeURIComponent(callId || '')}`;
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -136,21 +154,26 @@ fastify.all('/outbound-answer', async (request, reply) => {
     <Stream url="${wsUrl}"/>
   </Connect>
 </Response>`;
+  jlog('debug', 'Responding TwiML for outbound-answer', { callId, wsUrl });
   reply.type('text/xml').send(twiml);
 });
 
 fastify.post('/call-status', async (request, reply) => {
+  if (!validateTwilioSignature(request)) {
+    return reply.code(403).type('text/plain').send('Invalid Twilio signature');
+  }
   const { callId } = request.query || {};
-  const { CallStatus, CallSid } = request.body || {};
-  if (['completed', 'failed', 'busy', 'no-answer', 'canceled'].includes((CallStatus || '').toLowerCase())) {
+  const { CallStatus, CallSid, To } = request.body || {};
+  const status = (CallStatus || '').toLowerCase();
+  if (['completed', 'failed', 'busy', 'no-answer', 'canceled'].includes(status)) {
     activeCallSessions.delete(callId);
   }
-  jlog('info', 'Call status update', { callId, CallStatus, CallSid });
+  jlog('info', 'Call status update', { callId, CallStatus, CallSid, To });
   reply.send({ received: true });
 });
 
 /* ============================
- * Media Stream bridge
+ * Media Stream bridge (Twilio <-> OpenAI)
  * ============================ */
 fastify.get('/media-stream', { websocket: true }, (connection, req) => {
   const { callId } = req.query || {};
@@ -165,7 +188,9 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
   });
 
   let streamSid = null;
-  let callSoftEndTimer;
+  let callSoftEndTimer = null;
+  let sessionReady = false;
+  const pendingAudio = []; // buffer OA deltas until Twilio streamSid exists
 
   function clearTimers() {
     if (callSoftEndTimer) clearTimeout(callSoftEndTimer);
@@ -175,10 +200,10 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
     oaWs.send(JSON.stringify({
       type: 'session.update',
       session: {
-        // Realtime requires this combo for audio
+        // Realtime requires this combo for audio responses
         modalities: ['audio', 'text'],
-        voice: voiceChoice,            // may be rejected -> we retry with alloy
-        input_audio_format: 'g711_ulaw',
+        voice: voiceChoice,               // if rejected -> we'll retry with alloy
+        input_audio_format: 'g711_ulaw',  // Twilio μ-law
         output_audio_format: 'g711_ulaw',
         turn_detection: {
           type: 'server_vad',
@@ -186,75 +211,122 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
           prefix_padding_ms: 300,
           silence_duration_ms: 500,
         },
-        instructions: `You are Kora from Boostly, an AI marketing assistant. Call ${lead?.name} from ${lead?.company}. Be friendly, casual, under 3 minutes.`,
+        instructions: [
+          `You are Kora from Boostly, an AI marketing assistant.`,
+          `You're calling ${lead?.name || 'a lead'} from ${lead?.company || 'their restaurant'} who requested marketing help.`,
+          `Be friendly, casual, concise. Confirm if they're the owner/manager; ask about current marketing & goals.`,
+          `Keep under ~3 minutes; offer to schedule if they’re busy.`,
+        ].join(' '),
       },
     }));
   }
 
+  // ---------- OpenAI WS ----------
   oaWs.on('open', () => {
     jlog('info', 'Connected to OpenAI Realtime');
-
-    // initial session config
     sendSessionUpdate(VOICE);
-
-    // opener (ensure audio+text)
-    oaWs.send(JSON.stringify({
-      type: 'response.create',
-      response: {
-        modalities: ['audio', 'text'],
-        instructions: `Hey ${lead?.name}! This is Kora from Boostly. You recently inquired about marketing services for ${lead?.company}. Got a quick minute to chat?`,
-      },
-    }));
-
-    // soft wrap-up
-    callSoftEndTimer = setTimeout(() => {
-      oaWs.send(JSON.stringify({
-        type: 'response.create',
-        response: {
-          modalities: ['audio', 'text'],
-          instructions: "I'll send you a quick follow-up by text. Thanks for your time!",
-        },
-      }));
-    }, MAX_CALL_SECONDS * 1000);
   });
 
-  oaWs.on('message', raw => {
-    let event;
-    try { event = JSON.parse(raw.toString()); }
-    catch { return; }
+  oaWs.on('message', (raw) => {
+    let evt;
+    try { evt = JSON.parse(raw.toString()); } catch { return; }
 
-    if (event.type === 'error') {
-      jlog('error', 'OpenAI error', { detail: event.error });
-      // If the chosen voice isn’t allowed, retry once with alloy
-      if (event.error?.param === 'session.voice' && VOICE !== FALLBACK_VOICE) {
+    if (evt.type === 'session.updated') {
+      if (!sessionReady) {
+        sessionReady = true;
+        jlog('info', 'OpenAI session updated — sending opener');
+        const opener = `Hey ${lead?.name || 'there'}! This is Kora from Boostly. You recently inquired about marketing for ${lead?.company || 'your restaurant'}. Got a quick minute to chat?`;
+        oaWs.send(JSON.stringify({
+          type: 'response.create',
+          response: { modalities: ['audio', 'text'], instructions: opener },
+        }));
+        callSoftEndTimer = setTimeout(() => {
+          oaWs.send(JSON.stringify({
+            type: 'response.create',
+            response: { modalities: ['audio', 'text'], instructions: "I'll text a quick follow-up. Thanks for your time!" },
+          }));
+        }, MAX_CALL_SECONDS * 1000);
+      }
+      return;
+    }
+
+    if (evt.type === 'error') {
+      jlog('error', 'OpenAI error', { detail: evt.error });
+      if (evt.error?.param === 'session.voice' && VOICE !== FALLBACK_VOICE) {
         jlog('warn', `Voice '${VOICE}' unavailable — retrying with '${FALLBACK_VOICE}'`);
         sendSessionUpdate(FALLBACK_VOICE);
       }
       return;
     }
 
-    if (event.type === 'response.audio.delta' && event.delta && streamSid) {
-      connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: event.delta } }));
+    if (evt.type === 'response.audio.delta' && evt.delta) {
+      if (streamSid) {
+        connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: evt.delta } }));
+      } else {
+        pendingAudio.push(evt.delta);
+      }
+      return;
     }
+
+    // optional debug
+    if (evt.type === 'response.created') jlog('debug', 'OpenAI response.created', { id: evt.response?.id });
+    if (evt.type === 'response.output_text.delta') jlog('debug', 'OpenAI text delta', { len: evt.delta?.length });
+    if (evt.type === 'response.output_text.done') jlog('debug', 'OpenAI text done');
   });
 
-  connection.on('message', twilioMessage => {
-    try {
-      const msg = JSON.parse(twilioMessage);
-      if (msg.event === 'start') {
-        streamSid = msg.start.streamSid;
-      } else if (msg.event === 'media') {
-        oaWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
-      } else if (msg.event === 'stop') {
-        clearTimers();
-        try { oaWs.close(); } catch {}
+  oaWs.on('close', (code, reason) => {
+    jlog('warn', 'OpenAI WS closed', { code, reason: reason?.toString?.() });
+    clearTimers();
+    try { connection.close(); } catch {}
+  });
+
+  oaWs.on('error', (err) => {
+    jlog('error', 'OpenAI WS error', { err });
+    try { connection.close(); } catch {}
+  });
+
+  // ---------- Twilio WS ----------
+  connection.on('message', (twilioMessage) => {
+    let msg;
+    try { msg = JSON.parse(twilioMessage); } catch { return; }
+
+    if (msg.event === 'start') {
+      streamSid = msg.start.streamSid;
+      jlog('info', 'Twilio stream started', { streamSid });
+
+      // flush buffered audio from OpenAI
+      if (pendingAudio.length) {
+        jlog('debug', `Flushing ${pendingAudio.length} buffered audio frames to Twilio`);
+        for (const delta of pendingAudio) {
+          connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: delta } }));
+        }
+        pendingAudio.length = 0;
       }
-    } catch {}
+      return;
+    }
+
+    if (msg.event === 'media') {
+      if (oaWs.readyState === WebSocket.OPEN) {
+        oaWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
+      }
+      return;
+    }
+
+    if (msg.event === 'stop') {
+      jlog('info', 'Twilio stream stopped');
+      clearTimers();
+      try { oaWs.close(); } catch {}
+      return;
+    }
   });
 
   connection.on('close', () => {
     clearTimers();
     try { oaWs.close(); } catch {}
+  });
+
+  connection.on('error', (err) => {
+    jlog('error', 'Twilio WS error', { err });
   });
 });
 
@@ -263,5 +335,11 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
  * ============================ */
 fastify.listen({ port: Number(PORT), host: '0.0.0.0' }, (err, address) => {
   if (err) { jlog('error', 'Failed to start', { err }); process.exit(1); }
-  jlog('info', 'Server listening', { address, model: OPENAI_REALTIME_MODEL, voice: VOICE, fallback: FALLBACK_VOICE });
+  jlog('info', 'Server listening', {
+    address,
+    model: OPENAI_REALTIME_MODEL,
+    voice: VOICE,
+    fallback: FALLBACK_VOICE,
+    validateSignatures: isSigValidationOn(),
+  });
 });
