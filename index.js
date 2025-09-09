@@ -17,7 +17,7 @@ const {
   TWILIO_PHONE_NUMBER,
   PUBLIC_BASE_URL = 'https://ai-sdr-7v9s.onrender.com',
   PORT = 10000,
-  VOICE = 'sol',
+  VOICE,
 } = process.env;
 
 // Check required vars
