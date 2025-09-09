@@ -20,7 +20,7 @@ const {
   TWILIO_PHONE_NUMBER,
   PUBLIC_BASE_URL,
   PORT = 10000,
-  VOICE = 'sol',          // preferred
+  VOICE = 'sol',                 // preferred voice
   TWILIO_VALIDATE_SIGNATURE = 'true',
   LOG_LEVEL = 'info',
 } = process.env;
@@ -45,7 +45,7 @@ if (missing.length) {
   process.exit(1);
 }
 
-const SAMPLE_RATE_HZ = 8000;              // Twilio Media Streams are 8k μ-law
+const SAMPLE_RATE_HZ = 8000; // Twilio Media Streams are 8k μ-law
 const MAX_CALL_SECONDS = 170;
 const OPENAI_REALTIME_URL =
   `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`;
@@ -99,6 +99,10 @@ function isSigValidationOn() {
 /* ============================
  * Routes
  * ============================ */
+fastify.get('/', async (_req, reply) => {
+  reply.send({ ok: true, msg: 'Boostly AI SDR is running' });
+});
+
 fastify.post('/make-call', async (request, reply) => {
   const { to, name, company } = request.body || {};
   if (!to || !name || !company) {
@@ -109,8 +113,8 @@ fastify.post('/make-call', async (request, reply) => {
     const call = await twilioClient.calls.create({
       from: TWILIO_PHONE_NUMBER,
       to,
-      url: getPublicUrl(`/outbound-answer?callId=${callId}`),
-      statusCallback: getPublicUrl(`/call-status?callId=${callId}`),
+      url: getPublicUrl(`/outbound-answer?callId=${encodeURIComponent(callId)}`),
+      statusCallback: getPublicUrl(`/call-status?callId=${encodeURIComponent(callId)}`),
       statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
       statusCallbackMethod: 'POST',
     });
@@ -125,7 +129,7 @@ fastify.post('/make-call', async (request, reply) => {
 
 fastify.all('/outbound-answer', async (request, reply) => {
   const { callId } = request.query || {};
-  const wsUrl = `${publicWsUrl()}/media-stream?callId=${encodeURIComponent(callId)}`;
+  const wsUrl = `${publicWsUrl()}/media-stream?callId=${encodeURIComponent(callId || '')}`;
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -168,41 +172,48 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
   }
 
   function sendSessionUpdate(voiceChoice) {
-  oaWs.send(JSON.stringify({
-    type: 'session.update',
-    session: {
-      modalities: ['text', 'audio'],
-      voice: voiceChoice,
--     input_audio_format:  { type: 'g711_ulaw', sample_rate_hz: SAMPLE_RATE_HZ },
--     output_audio_format: { type: 'g711_ulaw', sample_rate_hz: SAMPLE_RATE_HZ },
-+     input_audio_format:  'g711_ulaw',
-+     output_audio_format: 'g711_ulaw',
-      turn_detection: {
-        type: 'server_vad',
-        threshold: 0.5,
-        prefix_padding_ms: 300,
-        silence_duration_ms: 500,
+    oaWs.send(JSON.stringify({
+      type: 'session.update',
+      session: {
+        // Realtime expects this exact combo if you want audio
+        modalities: ['audio', 'text'],
+        voice: voiceChoice,                // may be rejected -> we handle in onmessage
+        input_audio_format: 'g711_ulaw',   // strings, not objects
+        output_audio_format: 'g711_ulaw',
+        turn_detection: {
+          type: 'server_vad',
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 500,
+        },
+        instructions: `You are Kora from Boostly, an AI marketing assistant. Call ${lead?.name} from ${lead?.company}. Be friendly, casual, under 3 minutes.`,
       },
-      instructions: `You are Kora from Boostly, an AI marketing assistant. Call ${lead?.name} from ${lead?.company}. Be friendly, casual, under 3 minutes.`,
-    },
-  }));
-}
-
+    }));
+  }
 
   oaWs.on('open', () => {
     jlog('info', 'Connected to OpenAI Realtime');
+
+    // initial session config
     sendSessionUpdate(VOICE);
 
-    // opener
+    // opener (ensure audio+text)
     oaWs.send(JSON.stringify({
       type: 'response.create',
-      response: { modalities: ['audio','text'], instructions: `Hey ${lead?.name}! This is Kora from Boostly. You recently inquired about marketing services for ${lead?.company}. Got a quick minute to chat?` },
+      response: {
+        modalities: ['audio', 'text'],
+        instructions: `Hey ${lead?.name}! This is Kora from Boostly. You recently inquired about marketing services for ${lead?.company}. Got a quick minute to chat?`,
+      },
     }));
 
+    // soft wrap-up
     callSoftEndTimer = setTimeout(() => {
       oaWs.send(JSON.stringify({
         type: 'response.create',
-        response: { modalities: ['audio','text'], instructions: "I'll send you a quick follow-up by text. Thanks for your time!" },
+        response: {
+          modalities: ['audio', 'text'],
+          instructions: "I'll send you a quick follow-up by text. Thanks for your time!",
+        },
       }));
     }, MAX_CALL_SECONDS * 1000);
   });
@@ -214,25 +225,36 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
 
     if (event.type === 'error') {
       jlog('error', 'OpenAI error', { detail: event.error });
+      // If the chosen voice isn’t allowed, retry once with alloy
       if (event.error?.param === 'session.voice' && VOICE === 'sol') {
         jlog('warn', 'Retrying with alloy voice');
         sendSessionUpdate(FALLBACK_VOICE);
       }
+      return;
     }
+
     if (event.type === 'response.audio.delta' && event.delta && streamSid) {
       connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: event.delta } }));
     }
   });
 
   connection.on('message', twilioMessage => {
-    const msg = JSON.parse(twilioMessage);
-    if (msg.event === 'start') {
-      streamSid = msg.start.streamSid;
-    } else if (msg.event === 'media') {
-      oaWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
-    } else if (msg.event === 'stop') {
-      clearTimers(); oaWs.close();
-    }
+    try {
+      const msg = JSON.parse(twilioMessage);
+      if (msg.event === 'start') {
+        streamSid = msg.start.streamSid;
+      } else if (msg.event === 'media') {
+        oaWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
+      } else if (msg.event === 'stop') {
+        clearTimers();
+        try { oaWs.close(); } catch {}
+      }
+    } catch {}
+  });
+
+  connection.on('close', () => {
+    clearTimers();
+    try { oaWs.close(); } catch {}
   });
 });
 
