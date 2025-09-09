@@ -99,8 +99,7 @@ function validateTwilioSignature(request) {
   try {
     const signature = request.headers['x-twilio-signature'];
     if (!signature) return false;
-    // Twilio signs the full public URL (including query string)
-    const fullUrl = `${PUBLIC_BASE_URL}${request.raw.url}`;
+    const fullUrl = `${PUBLIC_BASE_URL}${request.raw.url}`; // includes query
     const params = request.method === 'POST' ? (request.body || {}) : {};
     const ok = twilio.validateRequest(TWILIO_AUTH_TOKEN, signature, fullUrl, params);
     if (!ok) jlog('warn', 'Twilio signature validation failed', { fullUrl });
@@ -191,6 +190,8 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
   let callSoftEndTimer = null;
   let sessionReady = false;
   const pendingAudio = []; // buffer OA deltas until Twilio streamSid exists
+  let twilioMediaFramesIn = 0;
+  let oaAudioFramesOut = 0;
 
   function clearTimers() {
     if (callSoftEndTimer) clearTimeout(callSoftEndTimer);
@@ -200,9 +201,8 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
     oaWs.send(JSON.stringify({
       type: 'session.update',
       session: {
-        // Realtime requires this combo for audio responses
         modalities: ['audio', 'text'],
-        voice: voiceChoice,               // if rejected -> we'll retry with alloy
+        voice: voiceChoice,               // if rejected -> retry with alloy
         input_audio_format: 'g711_ulaw',  // Twilio μ-law
         output_audio_format: 'g711_ulaw',
         turn_detection: {
@@ -214,7 +214,7 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
         instructions: [
           `You are Kora from Boostly, an AI marketing assistant.`,
           `You're calling ${lead?.name || 'a lead'} from ${lead?.company || 'their restaurant'} who requested marketing help.`,
-          `Be friendly, casual, concise. Confirm if they're the owner/manager; ask about current marketing & goals.`,
+          `Be friendly, casual, concise. Confirm owner/manager; ask about current marketing & goals.`,
           `Keep under ~3 minutes; offer to schedule if they’re busy.`,
         ].join(' '),
       },
@@ -229,7 +229,10 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
 
   oaWs.on('message', (raw) => {
     let evt;
-    try { evt = JSON.parse(raw.toString()); } catch { return; }
+    try { evt = JSON.parse(raw.toString()); } catch (err) {
+      jlog('warn', 'Failed to parse OpenAI message', { err });
+      return;
+    }
 
     if (evt.type === 'session.updated') {
       if (!sessionReady) {
@@ -260,15 +263,18 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
     }
 
     if (evt.type === 'response.audio.delta' && evt.delta) {
+      oaAudioFramesOut++;
       if (streamSid) {
         connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: evt.delta } }));
       } else {
         pendingAudio.push(evt.delta);
       }
+      if (oaAudioFramesOut <= 3 || oaAudioFramesOut % 100 === 0) {
+        jlog('debug', 'OA → Twilio audio frame', { oaAudioFramesOut, buffered: pendingAudio.length, hasStreamSid: !!streamSid });
+      }
       return;
     }
 
-    // optional debug
     if (evt.type === 'response.created') jlog('debug', 'OpenAI response.created', { id: evt.response?.id });
     if (evt.type === 'response.output_text.delta') jlog('debug', 'OpenAI text delta', { len: evt.delta?.length });
     if (evt.type === 'response.output_text.done') jlog('debug', 'OpenAI text done');
@@ -287,35 +293,52 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
 
   // ---------- Twilio WS ----------
   connection.on('message', (twilioMessage) => {
-    let msg;
-    try { msg = JSON.parse(twilioMessage); } catch { return; }
+    let raw;
+    try {
+      raw = typeof twilioMessage === 'string' ? twilioMessage : twilioMessage.toString('utf8');
+      const msg = JSON.parse(raw);
 
-    if (msg.event === 'start') {
-      streamSid = msg.start.streamSid;
-      jlog('info', 'Twilio stream started', { streamSid });
+      if (msg.event === 'start') {
+        streamSid = msg.start.streamSid;
+        jlog('info', 'Twilio stream started', { streamSid });
 
-      // flush buffered audio from OpenAI
-      if (pendingAudio.length) {
-        jlog('debug', `Flushing ${pendingAudio.length} buffered audio frames to Twilio`);
-        for (const delta of pendingAudio) {
-          connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: delta } }));
+        // flush buffered audio from OpenAI
+        if (pendingAudio.length) {
+          jlog('debug', `Flushing ${pendingAudio.length} buffered audio frames to Twilio`);
+          for (const delta of pendingAudio) {
+            connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: delta } }));
+          }
+          pendingAudio.length = 0;
         }
-        pendingAudio.length = 0;
+        return;
       }
-      return;
-    }
 
-    if (msg.event === 'media') {
-      if (oaWs.readyState === WebSocket.OPEN) {
-        oaWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
+      if (msg.event === 'media') {
+        twilioMediaFramesIn++;
+        if (oaWs.readyState === WebSocket.OPEN) {
+          oaWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
+        }
+        if (twilioMediaFramesIn <= 3 || twilioMediaFramesIn % 100 === 0) {
+          jlog('debug', 'Twilio → OA media frame', { twilioMediaFramesIn });
+        }
+        return;
       }
-      return;
-    }
 
-    if (msg.event === 'stop') {
-      jlog('info', 'Twilio stream stopped');
-      clearTimers();
-      try { oaWs.close(); } catch {}
+      if (msg.event === 'stop') {
+        jlog('info', 'Twilio stream stopped');
+        clearTimers();
+        try { oaWs.close(); } catch {}
+        return;
+      }
+
+      // other events (mark, etc.)
+      jlog('debug', 'Twilio WS event', { event: msg.event });
+
+    } catch (err) {
+      jlog('error', 'Failed to parse Twilio WS message', {
+        err,
+        sample: raw ? raw.slice(0, 200) : '<no raw>',
+      });
       return;
     }
   });
