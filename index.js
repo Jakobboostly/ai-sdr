@@ -168,23 +168,26 @@ fastify.get('/media-stream', { websocket: true }, (connection, req) => {
   }
 
   function sendSessionUpdate(voiceChoice) {
-    oaWs.send(JSON.stringify({
-      type: 'session.update',
-      session: {
-        modalities: ['text', 'audio'],
-        voice: voiceChoice,
-        input_audio_format: { type: 'g711_ulaw', sample_rate_hz: SAMPLE_RATE_HZ },
-        output_audio_format: { type: 'g711_ulaw', sample_rate_hz: SAMPLE_RATE_HZ },
-        turn_detection: {
-          type: 'server_vad',
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 500,
-        },
-        instructions: `You are Kora from Boostly, an AI marketing assistant. Call ${lead?.name} from ${lead?.company}. Be friendly, casual, under 3 minutes.`,
+  oaWs.send(JSON.stringify({
+    type: 'session.update',
+    session: {
+      modalities: ['text', 'audio'],
+      voice: voiceChoice,
+-     input_audio_format:  { type: 'g711_ulaw', sample_rate_hz: SAMPLE_RATE_HZ },
+-     output_audio_format: { type: 'g711_ulaw', sample_rate_hz: SAMPLE_RATE_HZ },
++     input_audio_format:  'g711_ulaw',
++     output_audio_format: 'g711_ulaw',
+      turn_detection: {
+        type: 'server_vad',
+        threshold: 0.5,
+        prefix_padding_ms: 300,
+        silence_duration_ms: 500,
       },
-    }));
-  }
+      instructions: `You are Kora from Boostly, an AI marketing assistant. Call ${lead?.name} from ${lead?.company}. Be friendly, casual, under 3 minutes.`,
+    },
+  }));
+}
+
 
   oaWs.on('open', () => {
     jlog('info', 'Connected to OpenAI Realtime');
