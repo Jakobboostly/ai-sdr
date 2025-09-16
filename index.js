@@ -451,10 +451,6 @@ fastify.register(async (fastify) => {
                     output_audio_format: 'g711_ulaw',
                     voice: VOICE,
                     modalities: ["audio", "text"],
-                    input_audio_transcription: {
-                        enabled: true,
-                        model: 'whisper-1'
-                    },
                     temperature: 0.8,
                     // KORA INSTRUCTIONS
                     instructions: `You are Kora, Boostly's friendly marketing consultant. You're calling ${leadData?.name} from ${leadData?.company} who recently filled out a form on Facebook about restaurant marketing.
@@ -546,7 +542,7 @@ Remember: Be conversational and natural! Let them talk!`
                             type: 'message',
                             role: 'system',
                             content: [{
-                                type: 'text',
+                                type: 'input_text',
                                 text: 'Start the conversation now by greeting the customer.'
                             }]
                         }
