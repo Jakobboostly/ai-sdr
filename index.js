@@ -425,10 +425,9 @@ fastify.register(async (fastify) => {
         console.log(`Connected to ${leadData?.name} at ${leadData?.company}`);
         
         // Connect to OpenAI
-        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime', {
+        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-realtime', {
             headers: {
-                Authorization: `Bearer ${OPENAI_API_KEY}`,
-                "OpenAI-Beta": "realtime=v1"
+                Authorization: `Bearer ${OPENAI_API_KEY}`
             }
         });
         
@@ -439,20 +438,7 @@ fastify.register(async (fastify) => {
             const sessionUpdate = {
                 type: 'session.update',
                 session: {
-                    // Fixed turn detection settings
-                    turn_detection: { 
-                        type: 'server_vad',
-                        threshold: 0.5,
-                        prefix_padding_ms: 300,
-                        silence_duration_ms: 1500,
-                        create_response: true
-                    },
-                    input_audio_format: 'g711_ulaw',
-                    output_audio_format: 'g711_ulaw',
-                    voice: VOICE,
-                    modalities: ["audio", "text"],
-                    temperature: 0.8,
-                    // KORA INSTRUCTIONS
+                    type: 'realtime',
                     instructions: `You are Kora, Boostly's friendly marketing consultant. You're calling ${leadData?.name} from ${leadData?.company} who recently filled out a form on Facebook about restaurant marketing.
 
 PERSONALITY:
@@ -523,51 +509,26 @@ IMPORTANT RULES:
 Remember: Be conversational and natural! Let them talk!`
                 }
             };
-            
+
             console.log('Sending session configuration to OpenAI...');
             openAiWs.send(JSON.stringify(sessionUpdate));
         };
         
-        // OpenAI WebSocket opened
-        openAiWs.on('open', () => {
+        // OpenAI WebSocket opened - follow OpenAI's exact example
+        openAiWs.on('open', function open() {
             console.log('Connected to OpenAI Realtime API');
-            setTimeout(() => {
-                sendSessionUpdate();
-                // After session update, add a system message to trigger greeting
-                setTimeout(() => {
-                    // Add a conversation item to trigger the AI
-                    const conversationItem = {
-                        type: 'conversation.item.create',
-                        item: {
-                            type: 'message',
-                            role: 'system',
-                            content: [{
-                                type: 'input_text',
-                                text: 'Start the conversation now by greeting the customer.'
-                            }]
-                        }
-                    };
-                    openAiWs.send(JSON.stringify(conversationItem));
 
-                    // Then trigger response
-                    setTimeout(() => {
-                        const createResponse = {
-                            type: 'response.create'
-                        };
-                        openAiWs.send(JSON.stringify(createResponse));
-                        console.log('Triggered AI to start conversation');
-                    }, 100);
-                }, 500);
-            }, 250);
+            // Send session update immediately as per OpenAI docs
+            sendSessionUpdate();
         });
         
-        // Handle OpenAI responses
-        openAiWs.on('message', (data) => {
+        // Handle OpenAI responses - as per OpenAI docs
+        openAiWs.on('message', function incoming(message) {
             try {
-                const response = JSON.parse(data);
+                const response = JSON.parse(message.toString());
 
-                // Log ALL message types for debugging
-                console.log('OpenAI message type:', response.type);
+                // Log message type for debugging
+                console.log('OpenAI event:', response.type);
 
                 // Log important message types
                 if (response.type === 'session.created') {
