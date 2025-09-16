@@ -450,7 +450,11 @@ fastify.register(async (fastify) => {
                     input_audio_format: 'g711_ulaw',
                     output_audio_format: 'g711_ulaw',
                     voice: VOICE,
-                    modalities: ["text", "audio"],
+                    modalities: ["audio", "text"],
+                    input_audio_transcription: {
+                        enabled: true,
+                        model: 'whisper-1'
+                    },
                     temperature: 0.8,
                     // KORA INSTRUCTIONS
                     instructions: `You are Kora, Boostly's friendly marketing consultant. You're calling ${leadData?.name} from ${leadData?.company} who recently filled out a form on Facebook about restaurant marketing.
@@ -533,17 +537,30 @@ Remember: Be conversational and natural! Let them talk!`
             console.log('Connected to OpenAI Realtime API');
             setTimeout(() => {
                 sendSessionUpdate();
-                // After session update, trigger the AI to start speaking
+                // After session update, add a system message to trigger greeting
                 setTimeout(() => {
-                    const createResponse = {
-                        type: 'response.create',
-                        response: {
-                            modalities: ['text', 'audio'],
-                            instructions: 'Please greet the customer and start the conversation'
+                    // Add a conversation item to trigger the AI
+                    const conversationItem = {
+                        type: 'conversation.item.create',
+                        item: {
+                            type: 'message',
+                            role: 'system',
+                            content: [{
+                                type: 'text',
+                                text: 'Start the conversation now by greeting the customer.'
+                            }]
                         }
                     };
-                    openAiWs.send(JSON.stringify(createResponse));
-                    console.log('Triggered AI to start conversation');
+                    openAiWs.send(JSON.stringify(conversationItem));
+
+                    // Then trigger response
+                    setTimeout(() => {
+                        const createResponse = {
+                            type: 'response.create'
+                        };
+                        openAiWs.send(JSON.stringify(createResponse));
+                        console.log('Triggered AI to start conversation');
+                    }, 100);
                 }, 500);
             }, 250);
         });
