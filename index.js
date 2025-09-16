@@ -425,7 +425,7 @@ fastify.register(async (fastify) => {
         console.log(`Connected to ${leadData?.name} at ${leadData?.company}`);
         
         // Connect to OpenAI
-        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
+        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17', {
             headers: {
                 Authorization: `Bearer ${OPENAI_API_KEY}`,
                 "OpenAI-Beta": "realtime=v1"
@@ -531,14 +531,38 @@ Remember: Be conversational and natural! Let them talk!`
         // OpenAI WebSocket opened
         openAiWs.on('open', () => {
             console.log('Connected to OpenAI Realtime API');
-            setTimeout(sendSessionUpdate, 250);
+            setTimeout(() => {
+                sendSessionUpdate();
+                // After session update, trigger the AI to start speaking
+                setTimeout(() => {
+                    const createResponse = {
+                        type: 'response.create'
+                    };
+                    openAiWs.send(JSON.stringify(createResponse));
+                    console.log('Triggered AI to start conversation');
+                }, 500);
+            }, 250);
         });
         
         // Handle OpenAI responses
         openAiWs.on('message', (data) => {
             try {
                 const response = JSON.parse(data);
-                
+
+                // Log important message types
+                if (response.type === 'session.created') {
+                    console.log('✅ Session created');
+                }
+                if (response.type === 'session.updated') {
+                    console.log('✅ Session updated successfully');
+                }
+                if (response.type === 'response.created') {
+                    console.log('🎤 AI starting to generate response');
+                }
+                if (response.type === 'response.audio.transcript.delta') {
+                    console.log('📝 AI saying:', response.delta);
+                }
+
                 if (response.type === 'response.audio.delta' && response.delta) {
                     const audioDelta = {
                         event: 'media',
@@ -546,10 +570,14 @@ Remember: Be conversational and natural! Let them talk!`
                         media: { payload: response.delta }
                     };
                     connection.send(JSON.stringify(audioDelta));
+                    // Log occasionally to confirm audio is being sent
+                    if (Math.random() < 0.02) {
+                        console.log('📤 Sending audio to phone');
+                    }
                 }
-                
+
                 if (response.type === 'error') {
-                    console.error('OpenAI Error:', response);
+                    console.error('❌ OpenAI Error:', response.error);
                 }
                 
             } catch (error) {
