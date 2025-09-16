@@ -536,7 +536,11 @@ Remember: Be conversational and natural! Let them talk!`
                 // After session update, trigger the AI to start speaking
                 setTimeout(() => {
                     const createResponse = {
-                        type: 'response.create'
+                        type: 'response.create',
+                        response: {
+                            modalities: ['text', 'audio'],
+                            instructions: 'Please greet the customer and start the conversation'
+                        }
                     };
                     openAiWs.send(JSON.stringify(createResponse));
                     console.log('Triggered AI to start conversation');
