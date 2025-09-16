@@ -439,6 +439,9 @@ fastify.register(async (fastify) => {
                 type: 'session.update',
                 session: {
                     type: 'realtime',
+                    voice: 'alloy',
+                    input_audio_format: 'g711_ulaw',
+                    output_audio_format: 'g711_ulaw',
                     instructions: `You are Kora, Boostly's friendly marketing consultant. You're calling ${leadData?.name} from ${leadData?.company} who recently filled out a form on Facebook about restaurant marketing.
 
 PERSONALITY:
@@ -536,6 +539,16 @@ Remember: Be conversational and natural! Let them talk!`
                 }
                 if (response.type === 'session.updated') {
                     console.log('✅ Session updated successfully');
+
+                    // Now trigger the AI to start speaking
+                    const createResponse = {
+                        type: 'response.create',
+                        response: {
+                            modalities: ['audio', 'text']
+                        }
+                    };
+                    openAiWs.send(JSON.stringify(createResponse));
+                    console.log('Triggered AI to start speaking');
                 }
                 if (response.type === 'response.created') {
                     console.log('🎤 AI starting to generate response');
