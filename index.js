@@ -43,7 +43,6 @@ const PORT = process.env.PORT || 5050;
 
 // Store active calls and their data
 const activeCallSessions = new Map();
-const callAttempts = new Map();
 const bookedDemos = new Map(); // Store actual booked demos
 
 // ============= DEMO SCHEDULING CONFIGURATION =============
@@ -212,27 +211,17 @@ fastify.post('/make-call', async (request, reply) => {
         });
     }
     
-    // Track call attempts
-    const attempts = callAttempts.get(to) || 0;
-    if (attempts >= 2) {
-        return reply.send({ 
-            success: false, 
-            message: 'Already attempted 2 calls to this number today' 
-        });
-    }
-    
     try {
         const callId = generateCallId();
-        
+
         // Store lead data
         activeCallSessions.set(callId, {
             name,
             company,
             email: email || '',
-            phoneNumber: to,
-            attemptNumber: attempts + 1
+            phoneNumber: to
         });
-        
+
         // Make the call
         const call = await twilioClient.calls.create({
             from: TWILIO_PHONE_NUMBER,
@@ -244,15 +233,11 @@ fastify.post('/make-call', async (request, reply) => {
             asyncAmd: true,
             timeout: 30
         });
-        
-        // Update attempts
-        callAttempts.set(to, attempts + 1);
-        
-        reply.send({ 
-            success: true, 
+
+        reply.send({
+            success: true,
             callSid: call.sid,
-            message: `Calling ${name} at ${company}...`,
-            attemptNumber: attempts + 1
+            message: `Calling ${name} at ${company}...`
         });
         
     } catch (error) {
@@ -300,9 +285,6 @@ fastify.post('/call-status', async (request, reply) => {
     if (CallStatus === 'completed' || CallStatus === 'no-answer' || CallStatus === 'busy') {
         console.log(`Call Result - Name: ${leadData?.name}, Company: ${leadData?.company}, Status: ${CallStatus}, Duration: ${CallDuration}s`);
         
-        if ((CallStatus === 'no-answer' || CallStatus === 'busy') && leadData?.attemptNumber === 1) {
-            console.log(`Will retry ${leadData?.name} later (attempt 2 of 2)`);
-        }
         
         setTimeout(() => {
             activeCallSessions.delete(callId);
@@ -470,15 +452,6 @@ fastify.register(async (fastify) => {
                     voice: VOICE,
                     modalities: ["text", "audio"],
                     temperature: 0.8,
-                    // MCP TOOLS
-                    tools: [
-                        {
-                            type: "mcp",
-                            server_label: "calendar",
-                            server_url: `https://${req.headers.host}/mcp`,
-                            require_approval: "never"
-                        }
-                    ],
                     // KORA INSTRUCTIONS
                     instructions: `You are Kora, Boostly's friendly marketing consultant. You're calling ${leadData?.name} from ${leadData?.company} who recently filled out a form on Facebook about restaurant marketing.
 
