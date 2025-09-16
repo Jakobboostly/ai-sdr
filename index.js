@@ -549,6 +549,9 @@ Remember: Be conversational and natural! Let them talk!`
             try {
                 const response = JSON.parse(data);
 
+                // Log ALL message types for debugging
+                console.log('OpenAI message type:', response.type);
+
                 // Log important message types
                 if (response.type === 'session.created') {
                     console.log('✅ Session created');
@@ -564,15 +567,24 @@ Remember: Be conversational and natural! Let them talk!`
                 }
 
                 if (response.type === 'response.audio.delta' && response.delta) {
+                    if (!streamSid) {
+                        console.log('⚠️ No stream ID yet, waiting...');
+                        return;
+                    }
+
                     const audioDelta = {
                         event: 'media',
                         streamSid: streamSid,
-                        media: { payload: response.delta }
+                        media: {
+                            payload: response.delta
+                        }
                     };
+
                     connection.send(JSON.stringify(audioDelta));
-                    // Log occasionally to confirm audio is being sent
-                    if (Math.random() < 0.02) {
-                        console.log('📤 Sending audio to phone');
+
+                    // Log more frequently during debugging
+                    if (Math.random() < 0.1) {
+                        console.log('📤 Sending audio to phone (streamSid:', streamSid, ')');
                     }
                 }
 
@@ -604,6 +616,7 @@ Remember: Be conversational and natural! Let them talk!`
                     case 'start':
                         streamSid = data.start.streamSid;
                         console.log('Call started, stream ID:', streamSid);
+                        console.log('Media format:', data.start.mediaFormat);
                         break;
                 }
             } catch (error) {
