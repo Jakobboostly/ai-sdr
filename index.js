@@ -425,7 +425,7 @@ fastify.register(async (fastify) => {
         console.log(`Connected to ${leadData?.name} at ${leadData?.company}`);
         
         // Connect to OpenAI
-        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17', {
+        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview', {
             headers: {
                 Authorization: `Bearer ${OPENAI_API_KEY}`,
                 "OpenAI-Beta": "realtime=v1"
