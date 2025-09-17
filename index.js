@@ -601,7 +601,7 @@ Remember: Be conversational and natural! Let them talk!`
                             payload: Buffer.from(response.delta, 'base64').toString('base64')
                         }
                     };
-                    connection.send(JSON.stringify(audioDelta));
+                    connection.socket.send(JSON.stringify(audioDelta));
                 }
 
                 if (response.type === 'error') {
