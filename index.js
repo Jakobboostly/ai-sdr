@@ -1,4 +1,3 @@
-// server.js
 import Fastify from 'fastify';
 import WebSocket from 'ws';
 import dotenv from 'dotenv';
@@ -9,7 +8,6 @@ import twilio from 'twilio';
 
 dotenv.config();
 
-// Required env
 const {
   OPENAI_API_KEY,
   TWILIO_ACCOUNT_SID,
@@ -27,7 +25,7 @@ if (!OPENAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHON
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-// Fastify
+// ---------- Fastify ----------
 const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
@@ -35,16 +33,13 @@ fastify.register(fastifyCors, { origin: true, credentials: true });
 
 const VOICE = 'alloy';
 
-// State
+// In-memory state
 const activeCallSessions = new Map();
 const bookedDemos = new Map();
 
-// ---------------- Notifications ----------------
+// ---------- Notifications ----------
 async function sendSlackNotification(demoData) {
-  if (!SLACK_WEBHOOK_URL) {
-    console.log('⚠️ No Slack webhook configured - skipping notification');
-    return;
-  }
+  if (!SLACK_WEBHOOK_URL) return;
   try {
     const message = {
       text: "🎯 New Boostly Demo Booked!",
@@ -75,15 +70,11 @@ async function sendSlackNotification(demoData) {
       ]
     };
     const res = await fetch(SLACK_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(message)
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(message)
     });
     if (!res.ok) console.error('❌ Slack notification failed:', res.status, await res.text());
-    else console.log('✅ Slack notification sent successfully');
-  } catch (err) {
-    console.error('❌ Error sending Slack notification:', err);
-  }
+    else console.log('✅ Slack notification sent');
+  } catch (e) { console.error('❌ Slack notify error:', e); }
 }
 
 async function sendSMS(demoData) {
@@ -95,9 +86,7 @@ async function sendSMS(demoData) {
       to: ADMIN_PHONE
     });
     console.log('✅ SMS notification sent');
-  } catch (err) {
-    console.error('❌ Error sending SMS:', err);
-  }
+  } catch (e) { console.error('❌ SMS error:', e); }
 }
 
 async function storeDemoData(demoData) {
@@ -121,7 +110,7 @@ function generateCallId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2);
 }
 
-// ---------------- Basic routes ----------------
+// ---------- Basic routes ----------
 fastify.get('/', async (_req, reply) => reply.send({ message: 'Boostly AI SDR is running!' }));
 
 fastify.get('/demos', async (_req, reply) => {
@@ -158,8 +147,7 @@ fastify.post('/make-call', async (request, reply) => {
 
 fastify.all('/outbound-answer', async (request, reply) => {
   const callId = request.query.callId;
-
-  // ✅ Pass callId via <Parameter> so Twilio includes it in the WS "start" message
+  // Pass callId via <Parameter> so Twilio includes it in WS "start"
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -183,7 +171,7 @@ fastify.post('/call-status', async (request, reply) => {
   reply.send({ received: true });
 });
 
-// ---------------- MCP calendar endpoints ----------------
+// ---------- MCP demo endpoints ----------
 const DEMO_SLOTS = {
   monday: ["9:00 AM", "10:00 AM", "11:00 AM", "2:00 PM", "3:00 PM", "4:00 PM"],
   tuesday: ["9:00 AM", "10:00 AM", "11:00 AM", "2:00 PM", "3:00 PM", "4:00 PM"],
@@ -277,31 +265,33 @@ fastify.post('/mcp/call_tool', async (request) => {
   return { error: 'Unknown tool' };
 });
 
-// ---------------- Media Stream bridge (Twilio <-> OpenAI Realtime) ----------------
+// ---------- Twilio <-> OpenAI bridge ----------
 fastify.register(async (instance) => {
   instance.get('/media-stream', { websocket: true }, (connection, req) => {
-    const ws = connection.socket; // Fastify's raw WebSocket
+    const ws = connection.socket; // raw ws
 
-    // Connect to OpenAI Realtime immediately (but DON'T start speaking yet)
+    // Connect to OpenAI Realtime
     const openAiWs = new WebSocket(
       'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
-      {
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          'OpenAI-Beta': 'realtime=v1'
-        }
-      }
+      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } }
     );
 
     let streamSid = null;
     let callId = null;
     let leadData = null;
-    let lastCommitTs = 0;
-    let oaOpen = false;
-    let needKickoff = false;
 
-    // Buffer model audio until we have streamSid
+    // Commit gating
+    const FRAME_MS = 20;                // Twilio frame ≈20ms at 8kHz
+    let framesSinceCommit = 0;          // frames appended since last commit
+    let haveUncommittedAudio = false;   // whether anything appended since last commit
+
+    // Response gating
+    let responseInFlight = false;
+
+    // Buffer model audio until streamSid known
     const pendingModelAudio = [];
+    let oaOpen = false;
+    let kickoffPending = false;
 
     const sendSessionUpdate = () => {
       if (!oaOpen) return;
@@ -365,16 +355,11 @@ RULES:
       const sessionUpdate = {
         type: 'session.update',
         session: {
-          modalities: ['audio', 'text'],        // ✅ BOTH
+          modalities: ['audio', 'text'],
           voice: VOICE,
-          input_audio_format: 'g711_ulaw',      // Twilio μ-law 8kHz
-          output_audio_format: 'g711_ulaw',     // back to Twilio
-          turn_detection: {
-            type: 'server_vad',
-            threshold: 0.5,
-            prefix_padding_ms: 300,
-            silence_duration_ms: 1500  // Wait 1.5 seconds of silence before responding
-          },
+          input_audio_format: 'g711_ulaw',
+          output_audio_format: 'g711_ulaw',
+          turn_detection: { type: 'server_vad' },
           temperature: 0.8,
           instructions
         }
@@ -383,29 +368,26 @@ RULES:
     };
 
     const kickoffConversation = () => {
-      if (!oaOpen) { needKickoff = true; return; }
-      // Start only after Twilio 'start' gives us the streamSid
-      const kickoff = {
+      if (!oaOpen || !streamSid) { kickoffPending = true; return; }
+      // Start the first response once Twilio stream is ready
+      openAiWs.send(JSON.stringify({
         type: 'conversation.item.create',
-        item: {
-          type: 'message',
-          role: 'system',
-          content: [{ type: 'input_text', text: 'Start the conversation with a friendly greeting.' }]
-        }
-      };
-      openAiWs.send(JSON.stringify(kickoff));
-      openAiWs.send(JSON.stringify({ type: 'response.create' }));
+        item: { type: 'message', role: 'system', content: [{ type: 'input_text', text: 'Start the conversation with a friendly greeting.' }] }
+      }));
+      if (!responseInFlight) {
+        responseInFlight = true;
+        openAiWs.send(JSON.stringify({ type: 'response.create' }));
+      }
     };
 
     // ---- OpenAI events ----
     openAiWs.on('open', () => {
       oaOpen = true;
       console.log('Connected to the OpenAI Realtime API');
-      // We wait for Twilio 'start' to know callId/leadData, then sendSessionUpdate + kickoff
-      if (needKickoff) {
+      if (kickoffPending) {
         sendSessionUpdate();
         kickoffConversation();
-        needKickoff = false;
+        kickoffPending = false;
       }
     });
 
@@ -413,28 +395,37 @@ RULES:
       let response;
       try { response = JSON.parse(msg); } catch { return; }
 
-      // Log terse
+      // Mark response in-flight bookkeeping
+      if (response.type === 'response.created') responseInFlight = true;
+      if (response.type === 'response.done') responseInFlight = false;
+
+      // Log tersely
       if (!['response.audio.delta', 'response.output_audio.delta'].includes(response.type)) {
         console.log('OpenAI event:', response.type);
       }
 
-      // Forward model audio to Twilio (handle both event names)
+      // Forward model audio to Twilio
       if ((response.type === 'response.audio.delta' || response.type === 'response.output_audio.delta') && response.delta) {
         if (!streamSid) {
-          // Buffer until Twilio sends 'start'
           pendingModelAudio.push(response.delta);
-          console.warn('Got model audio before Twilio streamSid was set; buffering frame.');
+          // do not log every time; noisy
         } else {
           const audioDelta = { event: 'media', streamSid, media: { payload: response.delta } };
           try { ws.send(JSON.stringify(audioDelta)); } catch (e) { console.error('Send to Twilio failed:', e); }
         }
       }
 
-      // Trigger a reply when VAD says caller stopped
+      // When VAD indicates user stopped, only create a response if none active
       if (response.type === 'input_audio_buffer.speech_stopped') {
-        // Only commit the buffer, don't trigger response immediately
-        // Let the model decide when to respond based on context
-        openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+        if (haveUncommittedAudio) {
+          openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+          haveUncommittedAudio = false;
+          framesSinceCommit = 0;
+        }
+        if (!responseInFlight) {
+          responseInFlight = true;
+          openAiWs.send(JSON.stringify({ type: 'response.create' }));
+        }
       }
 
       if (response.type === 'error') {
@@ -445,12 +436,12 @@ RULES:
     openAiWs.on('close', () => console.log('Disconnected from OpenAI'));
     openAiWs.on('error', (err) => console.error('OpenAI WebSocket error:', err));
 
-    // Keepalive for OpenAI WS
+    // Keepalive OpenAI
     const oaPing = setInterval(() => {
       try { if (openAiWs.readyState === WebSocket.OPEN) openAiWs.ping(); } catch {}
     }, 20_000);
 
-    // ---- Twilio stream events (listen on the raw socket) ----
+    // ---- Twilio events (raw socket) ----
     ws.on('message', (raw) => {
       let data;
       try { data = JSON.parse(raw); } catch { return; }
@@ -459,14 +450,14 @@ RULES:
         case 'start': {
           streamSid = data.start?.streamSid;
 
-          // Get callId from customParameters (preferred)
+          // Prefer customParameters
           const params = data.start?.customParameters || {};
           callId = params.callId || callId;
 
           // Fallback: parse query if present
           if (!callId) {
             try {
-              const urlObj = new URL(`wss://x${req.url}`); // req.url may include query
+              const urlObj = new URL(`wss://x${req.url}`);
               callId = urlObj.searchParams.get('callId');
             } catch {}
           }
@@ -474,20 +465,18 @@ RULES:
           leadData = activeCallSessions.get(callId);
           console.log('Twilio stream started. streamSid:', streamSid, 'callId:', callId, 'lead:', leadData);
 
-          // Now that we have leadData + streamSid, configure session & start the conversation
           if (oaOpen) {
             sendSessionUpdate();
             kickoffConversation();
           } else {
-            needKickoff = true; // do it when OA opens
+            kickoffPending = true;
           }
 
-          // Flush any buffered model audio frames
+          // Flush buffered model audio (if any)
           if (pendingModelAudio.length) {
             for (const delta of pendingModelAudio) {
-              try {
-                ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: delta } }));
-              } catch (e) { console.error('Send buffered frame failed:', e); }
+              try { ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: delta } })); }
+              catch (e) { console.error('Send buffered frame failed:', e); }
             }
             pendingModelAudio.length = 0;
           }
@@ -496,33 +485,38 @@ RULES:
 
         case 'media': {
           // Append inbound μ-law audio (base64) to the model
-          if (openAiWs.readyState === WebSocket.OPEN && data.media?.payload) {
-            openAiWs.send(JSON.stringify({
-              type: 'input_audio_buffer.append',
-              audio: data.media.payload
-            }));
+          const payload = data.media?.payload;
+          if (openAiWs.readyState === WebSocket.OPEN && payload) {
+            openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
+            framesSinceCommit += 1;
+            haveUncommittedAudio = true;
 
-            // Commit every ~300ms so the model can process
-            const now = Date.now();
-            if (now - lastCommitTs > 300) {
+            // Commit only when we have at least ~100ms
+            if (framesSinceCommit * FRAME_MS >= 120) { // 6 frames ≈120ms
               openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-              lastCommitTs = now;
+              framesSinceCommit = 0;
+              haveUncommittedAudio = false;
             }
           }
           break;
         }
 
         case 'stop': {
-          // Finalize and request a response
-          if (openAiWs.readyState === WebSocket.OPEN) {
+          // Finalize audio if any was appended since the last commit
+          if (openAiWs.readyState === WebSocket.OPEN && haveUncommittedAudio) {
             openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+            framesSinceCommit = 0;
+            haveUncommittedAudio = false;
+          }
+          // Ask for a response only if none is active
+          if (openAiWs.readyState === WebSocket.OPEN && !responseInFlight) {
+            responseInFlight = true;
             openAiWs.send(JSON.stringify({ type: 'response.create' }));
           }
           break;
         }
 
         default:
-          // ignore marks, etc.
           break;
       }
     });
@@ -535,7 +529,7 @@ RULES:
 
     ws.on('error', (e) => console.error('Twilio WS error:', e));
 
-    // Keepalive Twilio side
+    // Keepalive Twilio
     const twilioPing = setInterval(() => {
       try { ws.ping(); } catch {}
     }, 25_000);
@@ -543,12 +537,9 @@ RULES:
   });
 });
 
-// ---------------- Start server ----------------
+// ---------- Start server ----------
 fastify.listen({ port: Number(PORT), host: '0.0.0.0' }, (err, address) => {
-  if (err) {
-    console.error(err);
-    process.exit(1);
-  }
+  if (err) { console.error(err); process.exit(1); }
   console.log(`\n${'='.repeat(60)}`);
   console.log(`Boostly AI SDR running at ${address}`);
   console.log(`MCP Calendar endpoints available at /mcp/*`);
