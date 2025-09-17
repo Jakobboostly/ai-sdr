@@ -393,14 +393,23 @@ RULES:
       let response;
       try { response = JSON.parse(msg); } catch { return; }
 
-      if (response.type !== 'response.output_audio.delta') {
+      // Keep logs tidy
+      if (!['response.audio.delta', 'response.output_audio.delta'].includes(response.type)) {
         console.log('OpenAI event:', response.type);
       }
 
-      // Forward model audio to Twilio (already base64 μ-law)
-      if (response.type === 'response.output_audio.delta' && response.delta && streamSid) {
-        const audioDelta = { event: 'media', streamSid, media: { payload: response.delta } };
-        try { connection.socket.send(JSON.stringify(audioDelta)); } catch (e) { console.error('Send to Twilio failed:', e); }
+      // ✅ Forward model audio to Twilio (handle both event names)
+      if (
+        (response.type === 'response.audio.delta' || response.type === 'response.output_audio.delta') &&
+        response.delta
+      ) {
+        if (!streamSid) {
+          console.warn('Got model audio before Twilio streamSid was set; dropping frame.');
+        } else {
+          const audioDelta = { event: 'media', streamSid, media: { payload: response.delta } };
+          try { connection.socket.send(JSON.stringify(audioDelta)); } catch (e) { console.error('Send to Twilio failed:', e);
+          }
+        }
       }
 
       // Trigger response when VAD stops
