@@ -535,10 +535,30 @@ Remember: Be conversational and natural! Let them talk!`
                 // After session is configured, trigger the AI to start speaking
                 setTimeout(() => {
                     console.log('Triggering AI to start conversation...');
-                    const inputAudioBuffer = {
-                        type: 'input_audio_buffer.commit'
+                    // Send a conversation item to prompt the AI to speak first
+                    const conversationItem = {
+                        type: 'conversation.item.create',
+                        item: {
+                            type: 'message',
+                            role: 'system',
+                            content: [
+                                {
+                                    type: 'input_text',
+                                    text: 'Start the conversation by greeting the customer according to your instructions.'
+                                }
+                            ]
+                        }
                     };
-                    openAiWs.send(JSON.stringify(inputAudioBuffer));
+                    openAiWs.send(JSON.stringify(conversationItem));
+
+                    // Then create a response
+                    setTimeout(() => {
+                        const createResponse = {
+                            type: 'response.create'
+                        };
+                        openAiWs.send(JSON.stringify(createResponse));
+                        console.log('Response creation triggered');
+                    }, 100);
                 }, 500);
             }, 250);
         });
