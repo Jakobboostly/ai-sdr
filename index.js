@@ -369,7 +369,12 @@ RULES:
           voice: VOICE,
           input_audio_format: 'g711_ulaw',      // Twilio μ-law 8kHz
           output_audio_format: 'g711_ulaw',     // back to Twilio
-          turn_detection: { type: 'server_vad' },
+          turn_detection: {
+            type: 'server_vad',
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 1500  // Wait 1.5 seconds of silence before responding
+          },
           temperature: 0.8,
           instructions
         }
@@ -427,8 +432,9 @@ RULES:
 
       // Trigger a reply when VAD says caller stopped
       if (response.type === 'input_audio_buffer.speech_stopped') {
+        // Only commit the buffer, don't trigger response immediately
+        // Let the model decide when to respond based on context
         openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-        openAiWs.send(JSON.stringify({ type: 'response.create' }));
       }
 
       if (response.type === 'error') {
