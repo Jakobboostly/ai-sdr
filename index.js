@@ -424,24 +424,33 @@ fastify.register(async (fastify) => {
         
         console.log(`Connected to ${leadData?.name} at ${leadData?.company}`);
         
-        // Connect to OpenAI
-        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-realtime', {
+        // Connect to OpenAI - following Twilio's exact format
+        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=0.8', {
             headers: {
-                Authorization: `Bearer ${OPENAI_API_KEY}`
+                Authorization: `Bearer ${OPENAI_API_KEY}`,
             }
         });
         
         let streamSid = null;
         
-        // Create Kora's personality and instructions
+        // Create Kora's personality and instructions - following Twilio's exact format
         const sendSessionUpdate = () => {
             const sessionUpdate = {
                 type: 'session.update',
                 session: {
                     type: 'realtime',
-                    voice: 'alloy',
-                    input_audio_format: 'g711_ulaw',
-                    output_audio_format: 'g711_ulaw',
+                    model: 'gpt-realtime',
+                    output_modalities: ['audio'],
+                    audio: {
+                        input: {
+                            format: { type: 'audio/pcmu' },
+                            turn_detection: { type: 'server_vad' }
+                        },
+                        output: {
+                            format: { type: 'audio/pcmu' },
+                            voice: 'alloy'
+                        },
+                    },
                     instructions: `You are Kora, Boostly's friendly marketing consultant. You're calling ${leadData?.name} from ${leadData?.company} who recently filled out a form on Facebook about restaurant marketing.
 
 PERSONALITY:
@@ -517,12 +526,10 @@ Remember: Be conversational and natural! Let them talk!`
             openAiWs.send(JSON.stringify(sessionUpdate));
         };
         
-        // OpenAI WebSocket opened - follow OpenAI's exact example
-        openAiWs.on('open', function open() {
-            console.log('Connected to OpenAI Realtime API');
-
-            // Send session update immediately as per OpenAI docs
-            sendSessionUpdate();
+        // OpenAI WebSocket opened - follow Twilio's example with delay
+        openAiWs.on('open', () => {
+            console.log('Connected to the OpenAI Realtime API');
+            setTimeout(sendSessionUpdate, 250); // Ensure connection stability
         });
         
         // Handle OpenAI responses - as per OpenAI docs
@@ -538,17 +545,7 @@ Remember: Be conversational and natural! Let them talk!`
                     console.log('✅ Session created');
                 }
                 if (response.type === 'session.updated') {
-                    console.log('✅ Session updated successfully');
-
-                    // Now trigger the AI to start speaking
-                    const createResponse = {
-                        type: 'response.create',
-                        response: {
-                            modalities: ['audio', 'text']
-                        }
-                    };
-                    openAiWs.send(JSON.stringify(createResponse));
-                    console.log('Triggered AI to start speaking');
+                    console.log('Session updated successfully:', response);
                 }
                 if (response.type === 'response.created') {
                     console.log('🎤 AI starting to generate response');
@@ -557,26 +554,16 @@ Remember: Be conversational and natural! Let them talk!`
                     console.log('📝 AI saying:', response.delta);
                 }
 
-                if (response.type === 'response.audio.delta' && response.delta) {
-                    if (!streamSid) {
-                        console.log('⚠️ No stream ID yet, waiting...');
-                        return;
-                    }
-
+                // Handle audio response from OpenAI - EXACTLY as Twilio docs show
+                if (response.type === 'response.output_audio.delta' && response.delta) {
                     const audioDelta = {
                         event: 'media',
                         streamSid: streamSid,
                         media: {
-                            payload: response.delta
+                            payload: Buffer.from(response.delta, 'base64').toString('base64')
                         }
                     };
-
                     connection.send(JSON.stringify(audioDelta));
-
-                    // Log more frequently during debugging
-                    if (Math.random() < 0.1) {
-                        console.log('📤 Sending audio to phone (streamSid:', streamSid, ')');
-                    }
                 }
 
                 if (response.type === 'error') {
