@@ -1,3 +1,4 @@
+// server.js
 import Fastify from 'fastify';
 import WebSocket from 'ws';
 import dotenv from 'dotenv';
@@ -144,7 +145,7 @@ fastify.post('/make-call', async (request, reply) => {
       to,
       url: `https://${request.headers.host}/outbound-answer?callId=${callId}`,
       statusCallback: `https://${request.headers.host}/call-status?callId=${callId}`,
-      statusCallbackEvent: ['answered', 'completed', 'no-answer', 'busy'],
+      statusCallbackEvent: ['queued', 'initiated', 'ringing', 'answered', 'completed', 'no-answer', 'busy', 'failed'],
       machineDetection: 'DetectMessageEnd',
       asyncAmd: true,
       timeout: 30
@@ -158,15 +159,14 @@ fastify.post('/make-call', async (request, reply) => {
 
 fastify.all('/outbound-answer', async (request, reply) => {
   const callId = request.query.callId;
-  const amdStatus = request.body?.AnsweredBy;
-  if (amdStatus === 'machine_start' || amdStatus === 'fax' || amdStatus === 'machine_end_beep') {
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`;
-    return reply.type('text/xml').send(twiml);
-  }
+
+  // Pass callId via <Parameter> so we don't rely on query on the WS URL
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="wss://${request.headers.host}/media-stream?callId=${callId}" />
+    <Stream url="wss://${request.headers.host}/media-stream">
+      <Parameter name="callId" value="${callId}" />
+    </Stream>
   </Connect>
 </Response>`;
   reply.type('text/xml').send(twimlResponse);
@@ -177,8 +177,8 @@ fastify.post('/call-status', async (request, reply) => {
   const callId = request.query.callId;
   const leadData = activeCallSessions.get(callId);
   console.log(`Call to ${leadData?.name} (${To}): ${CallStatus}`);
-  if (['completed', 'no-answer', 'busy'].includes(CallStatus)) {
-    console.log(`Call Result - Name: ${leadData?.name}, Company: ${leadData?.company}, Status: ${CallStatus}, Duration: ${CallDuration}s`);
+  if (['completed', 'no-answer', 'busy', 'failed'].includes(CallStatus)) {
+    console.log(`Call Result - Name: ${leadData?.name}, Company: ${leadData?.company}, Status: ${CallStatus}, Duration: ${CallDuration || 0}s`);
     setTimeout(() => activeCallSessions.delete(callId), 60_000);
   }
   reply.send({ received: true });
@@ -281,12 +281,8 @@ fastify.post('/mcp/call_tool', async (request) => {
 });
 
 // ---------- Media Stream bridge (Twilio <-> OpenAI Realtime) ----------
-fastify.register(async (fastifyInstance) => {
-  fastifyInstance.get('/media-stream', { websocket: true }, (connection, req) => {
-    const callId = req.query.callId;
-    const leadData = activeCallSessions.get(callId);
-    console.log(`Connected to ${leadData?.name} at ${leadData?.company}`);
-
+fastify.register(async (instance) => {
+  instance.get('/media-stream', { websocket: true }, (connection, req) => {
     // Connect to OpenAI Realtime
     const openAiWs = new WebSocket(
       'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
@@ -299,16 +295,19 @@ fastify.register(async (fastifyInstance) => {
     );
 
     let streamSid = null;
+    let callId = null;
+    let leadData = null;
     let lastCommitTs = 0;
 
     const sendSessionUpdate = () => {
       const sessionUpdate = {
         type: 'session.update',
         session: {
-          modalities: ['audio'],
+          // ✅ Must include both audio and text
+          modalities: ['audio', 'text'],
           voice: VOICE,
           input_audio_format: 'g711_ulaw',   // Twilio μ-law 8kHz
-          output_audio_format: 'g711_ulaw',  // Back to Twilio as μ-law
+          output_audio_format: 'g711_ulaw',  // back to Twilio
           turn_detection: { type: 'server_vad' },
           temperature: 0.8,
           instructions: `You are Kora, Boostly's friendly marketing consultant. You're calling ${leadData?.name} from ${leadData?.company} who recently filled out a form on Facebook about restaurant marketing.
@@ -326,23 +325,21 @@ Qualify them (owner check) and book a demo if interested.
 
 CONVERSATION FLOW:
 
-1. OPENING (casual, 30 seconds):
+1. OPENING:
 "Hey ${leadData?.name}! This is Kora from Boostly. You recently filled out our form about marketing for ${leadData?.company}. Got a quick minute to chat?"
 [WAIT FOR FULL RESPONSE]
 
-2. QUALIFY (confirm owner):
+2. QUALIFY:
 "Just to make sure I'm talking to the right person - you're the owner, right?"
 [WAIT FOR FULL RESPONSE]
 IF NOT OWNER: "Ah, I really need to chat with the owner about this. Could you have them give me a call when they're free?"
 
-3. DISCOVERY (understand their needs):
-Ask naturally in conversation and WAIT FOR COMPLETE ANSWERS:
-- "How many customers you seeing weekly these days?" [PAUSE FOR ANSWER]
-- "What percentage actually come back for a second visit?" [PAUSE FOR ANSWER]
-- "What's your biggest headache with marketing right now?" [PAUSE FOR ANSWER]
+3. DISCOVERY (ask, then pause for full answers):
+- "How many customers you seeing weekly these days?"
+- "What percentage actually come back for a second visit?"
+- "What's your biggest headache with marketing right now?"
 
-4. VALUE PITCH (connect to their pain):
-Based on what they say, mention:
+4. VALUE PITCH (tailored):
 - "We help restaurants get 600-800% ROI through automated SMS marketing"
 - "Everything runs on autopilot - takes maybe 5 minutes a week"
 - "Like Michael at Russo's - he gets $15 back for every dollar spent"
@@ -352,33 +349,23 @@ When they show interest:
 "Let me check what times we have available..."
 [Use check_availability tool with when="tomorrow" or when="today"]
 "I've got [time] or [time] open. What works better for you?"
-[WAIT FOR THEIR CHOICE]
-
-After they choose:
+[WAIT FOR CHOICE]
+Then:
 "Perfect, let me get that scheduled..."
-[Use book_demo tool with all their information]
+[Use book_demo tool]
 "All set! Jakob will give you a call at [time] to show you exactly how this works."
 
 OBJECTION HANDLING:
+- "Too busy": emphasize autopilot; ask for slowest time for a 15-min demo
+- "Too expensive": emphasize ROI ($10-15 per $1 typical)
+- "Already have marketing": ask what; explain complementarity (SMS + reviews)
 
-"Too busy": 
-"I totally get it - running a restaurant is non-stop. That's exactly why we built everything to run on autopilot. When's your slowest time for a quick 15-minute demo?"
-
-"Too expensive":
-"I hear you, margins are tight. But our average restaurant sees $10-15 back for every dollar. Want to see what your specific ROI could look like?"
-
-"Already have marketing":
-"Nice! What are you using? [LISTEN] Cool, we actually work great alongside that. Most folks keep what's working and add us for the SMS and review side."
-
-IMPORTANT RULES:
-- ALWAYS pause and wait for complete responses
-- Don't interrupt or rush them
-- Keep your responses to 2-3 sentences max
-- Always book specific times, not "whenever works"
-- Never quote specific prices - it's customized
-- Website: Boostly.com
-
-Remember: Be conversational and natural! Let them talk!`
+RULES:
+- Pause and let them finish
+- Keep replies 2–3 sentences
+- Offer specific times (not "whenever")
+- No pricing specifics; it's customized
+- Website: Boostly.com`
         }
       };
       openAiWs.send(JSON.stringify(sessionUpdate));
@@ -387,10 +374,9 @@ Remember: Be conversational and natural! Let them talk!`
     // ---- OpenAI events ----
     openAiWs.on('open', () => {
       console.log('Connected to the OpenAI Realtime API');
-      // Configure session
       sendSessionUpdate();
 
-      // Kick-off: create a greeting
+      // Kickoff greeting
       const kickoff = {
         type: 'conversation.item.create',
         item: {
@@ -407,11 +393,8 @@ Remember: Be conversational and natural! Let them talk!`
       let response;
       try { response = JSON.parse(msg); } catch { return; }
 
-      if (['session.created', 'session.updated', 'response.created', 'response.output_audio.delta', 'input_audio_buffer.speech_started', 'input_audio_buffer.speech_stopped', 'response.done', 'error'].includes(response.type)) {
-        // keep logs lightweight
-        if (response.type !== 'response.output_audio.delta') {
-          console.log('OpenAI event:', response.type);
-        }
+      if (response.type !== 'response.output_audio.delta') {
+        console.log('OpenAI event:', response.type);
       }
 
       // Forward model audio to Twilio (already base64 μ-law)
@@ -420,12 +403,12 @@ Remember: Be conversational and natural! Let them talk!`
         try { connection.socket.send(JSON.stringify(audioDelta)); } catch (e) { console.error('Send to Twilio failed:', e); }
       }
 
-      // If VAD says user stopped speaking, ask model to respond
+      // Trigger response when VAD stops
       if (response.type === 'input_audio_buffer.speech_stopped') {
+        openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
         openAiWs.send(JSON.stringify({ type: 'response.create' }));
       }
 
-      // Log model errors
       if (response.type === 'error') {
         console.error('❌ OpenAI Error:', response.error || response);
       }
@@ -434,11 +417,9 @@ Remember: Be conversational and natural! Let them talk!`
     openAiWs.on('close', () => console.log('Disconnected from OpenAI'));
     openAiWs.on('error', (err) => console.error('OpenAI WebSocket error:', err));
 
-    // Simple keepalive for OpenAI WS
+    // Keepalive for OpenAI WS
     const oaPing = setInterval(() => {
-      if (openAiWs.readyState === WebSocket.OPEN) {
-        openAiWs.ping();
-      }
+      if (openAiWs.readyState === WebSocket.OPEN) openAiWs.ping();
     }, 20_000);
 
     // ---- Twilio stream events ----
@@ -449,7 +430,21 @@ Remember: Be conversational and natural! Let them talk!`
       switch (data.event) {
         case 'start': {
           streamSid = data.start?.streamSid;
-          console.log('Twilio stream started. streamSid:', streamSid, 'format:', data.start?.mediaFormat);
+
+          // ✅ Pull callId from Twilio custom parameters
+          const params = data.start?.customParameters || {};
+          callId = params.callId || callId;
+
+          // Fallback: parse query if present
+          if (!callId) {
+            try {
+              const urlObj = new URL(`wss://x${req.url}`); // req.url may include query
+              callId = urlObj.searchParams.get('callId');
+            } catch {}
+          }
+
+          leadData = activeCallSessions.get(callId);
+          console.log('Twilio stream started. streamSid:', streamSid, 'callId:', callId, 'lead:', leadData);
           break;
         }
         case 'media': {
@@ -460,7 +455,7 @@ Remember: Be conversational and natural! Let them talk!`
               audio: data.media.payload
             }));
 
-            // Commit periodically (~300ms) so the model processes frames
+            // Commit periodically (~300ms)
             const now = Date.now();
             if (now - lastCommitTs > 300) {
               openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
@@ -470,16 +465,14 @@ Remember: Be conversational and natural! Let them talk!`
           break;
         }
         case 'stop': {
-          // Stream ended; finalize buffer and request a response
+          // Finalize buffer and request a response
           if (openAiWs.readyState === WebSocket.OPEN) {
             openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
             openAiWs.send(JSON.stringify({ type: 'response.create' }));
           }
           break;
         }
-        case 'mark':
         default:
-          // ignore
           break;
       }
     });
@@ -487,14 +480,13 @@ Remember: Be conversational and natural! Let them talk!`
     connection.on('close', () => {
       clearInterval(oaPing);
       try { if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close(); } catch {}
-      console.log(`Call with ${leadData?.name || 'Unknown'} ended`);
+      console.log(`Call ${callId || ''} ended`);
     });
 
-    // Keepalive Twilio side (send ping frames)
+    // Keepalive Twilio side
     const twilioPing = setInterval(() => {
       try { connection.socket.ping(); } catch {}
     }, 25_000);
-
     connection.socket.on('close', () => clearInterval(twilioPing));
     connection.socket.on('error', (e) => console.error('Twilio WS error:', e));
   });
