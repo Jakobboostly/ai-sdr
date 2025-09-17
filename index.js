@@ -9,449 +9,309 @@ import twilio from 'twilio';
 // Load environment variables
 dotenv.config();
 
-// Check for required environment variables
-const { 
-    OPENAI_API_KEY, 
-    TWILIO_ACCOUNT_SID, 
-    TWILIO_AUTH_TOKEN, 
-    TWILIO_PHONE_NUMBER,
-    SLACK_WEBHOOK_URL  // Add this to your .env
+// Required env
+const {
+  OPENAI_API_KEY,
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  TWILIO_PHONE_NUMBER,
+  SLACK_WEBHOOK_URL,
+  ADMIN_PHONE,
+  PORT = 5050
 } = process.env;
 
 if (!OPENAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
-    console.error('Missing required environment variables. Please check your .env file.');
-    process.exit(1);
+  console.error('Missing required environment variables. Please check your .env file.');
+  process.exit(1);
 }
 
-// Initialize Twilio client
+// Twilio client
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-// Initialize Fastify
+// Fastify
 const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
-
-// Enable CORS
-fastify.register(fastifyCors, {
-    origin: true,
-    credentials: true
-});
+fastify.register(fastifyCors, { origin: true, credentials: true });
 
 // Constants
 const VOICE = 'alloy';
-const PORT = process.env.PORT || 5050;
 
-// Store active calls and their data
+// State
 const activeCallSessions = new Map();
-const bookedDemos = new Map(); // Store actual booked demos
+const bookedDemos = new Map();
 
-// ============= DEMO SCHEDULING CONFIGURATION =============
-const DEMO_SLOTS = {
-    monday: ["9:00 AM", "10:00 AM", "11:00 AM", "2:00 PM", "3:00 PM", "4:00 PM"],
-    tuesday: ["9:00 AM", "10:00 AM", "11:00 AM", "2:00 PM", "3:00 PM", "4:00 PM"],
-    wednesday: ["9:00 AM", "10:00 AM", "11:00 AM", "2:00 PM", "3:00 PM", "4:00 PM"],
-    thursday: ["9:00 AM", "10:00 AM", "11:00 AM", "2:00 PM", "3:00 PM", "4:00 PM"],
-    friday: ["9:00 AM", "10:00 AM", "11:00 AM", "2:00 PM", "3:00 PM"]
-};
-
-// ============= NOTIFICATION FUNCTIONS =============
+// ---------- Notifications ----------
 async function sendSlackNotification(demoData) {
-    if (!SLACK_WEBHOOK_URL) {
-        console.log('⚠️ No Slack webhook configured - skipping notification');
-        return;
-    }
-    
-    try {
-        const message = {
-            text: "🎯 New Boostly Demo Booked!",
-            blocks: [
-                {
-                    type: "header",
-                    text: {
-                        type: "plain_text",
-                        text: "🎯 New Demo Booked!"
-                    }
-                },
-                {
-                    type: "section",
-                    fields: [
-                        {
-                            type: "mrkdwn",
-                            text: `*Restaurant:*\n${demoData.restaurantName}`
-                        },
-                        {
-                            type: "mrkdwn",
-                            text: `*Owner:*\n${demoData.ownerName}`
-                        },
-                        {
-                            type: "mrkdwn",
-                            text: `*Phone:*\n${demoData.phone}`
-                        },
-                        {
-                            type: "mrkdwn",
-                            text: `*Email:*\n${demoData.email || 'Not provided'}`
-                        },
-                        {
-                            type: "mrkdwn",
-                            text: `*Date/Time:*\n${demoData.datetime}`
-                        },
-                        {
-                            type: "mrkdwn",
-                            text: `*Rep:*\nJakob`
-                        }
-                    ]
-                },
-                {
-                    type: "section",
-                    text: {
-                        type: "mrkdwn",
-                        text: `*Notes:*\n${demoData.notes || 'No notes provided'}`
-                    }
-                },
-                {
-                    type: "divider"
-                },
-                {
-                    type: "context",
-                    elements: [
-                        {
-                            type: "mrkdwn",
-                            text: `Booked by Kora AI at ${new Date().toLocaleString('en-US', { timeZone: 'America/Denver' })}`
-                        }
-                    ]
-                }
-            ]
-        };
-        
-        const response = await fetch(SLACK_WEBHOOK_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(message)
-        });
-        
-        if (response.ok) {
-            console.log('✅ Slack notification sent successfully');
-        } else {
-            console.error('❌ Slack notification failed:', response.statusText);
+  if (!SLACK_WEBHOOK_URL) {
+    console.log('⚠️ No Slack webhook configured - skipping notification');
+    return;
+  }
+  try {
+    const message = {
+      text: "🎯 New Boostly Demo Booked!",
+      blocks: [
+        { type: "header", text: { type: "plain_text", text: "🎯 New Demo Booked!" } },
+        {
+          type: "section",
+          fields: [
+            { type: "mrkdwn", text: `*Restaurant:*\n${demoData.restaurantName}` },
+            { type: "mrkdwn", text: `*Owner:*\n${demoData.ownerName}` },
+            { type: "mrkdwn", text: `*Phone:*\n${demoData.phone}` },
+            { type: "mrkdwn", text: `*Email:*\n${demoData.email || 'Not provided'}` },
+            { type: "mrkdwn", text: `*Date/Time:*\n${demoData.datetime}` },
+            { type: "mrkdwn", text: `*Rep:*\nJakob` }
+          ]
+        },
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: `*Notes:*\n${demoData.notes || 'No notes provided'}` }
+        },
+        { type: "divider" },
+        {
+          type: "context",
+          elements: [
+            { type: "mrkdwn", text: `Booked by Kora AI at ${new Date().toLocaleString('en-US', { timeZone: 'America/Denver' })}` }
+          ]
         }
-    } catch (error) {
-        console.error('❌ Error sending Slack notification:', error);
-    }
+      ]
+    };
+    const res = await fetch(SLACK_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(message)
+    });
+    if (res.ok) console.log('✅ Slack notification sent successfully');
+    else console.error('❌ Slack notification failed:', res.status, await res.text());
+  } catch (err) {
+    console.error('❌ Error sending Slack notification:', err);
+  }
 }
 
 async function sendSMS(demoData) {
-    // Send SMS to yourself about the new demo
-    try {
-        await twilioClient.messages.create({
-            body: `New Demo: ${demoData.restaurantName} - ${demoData.ownerName} - ${demoData.datetime}`,
-            from: TWILIO_PHONE_NUMBER,
-            to: process.env.ADMIN_PHONE || '+13035551234' // Add your phone to .env
-        });
-        console.log('✅ SMS notification sent');
-    } catch (error) {
-        console.error('❌ Error sending SMS:', error);
-    }
-}
-
-// Store demo in a simple JSON file (or database later)
-async function storeDemoData(demoData) {
-    const demoId = `DEMO-${Date.now()}`;
-    const fullDemo = {
-        id: demoId,
-        ...demoData,
-        bookedAt: new Date().toISOString(),
-        status: 'scheduled'
-    };
-    
-    // Store in memory for now
-    bookedDemos.set(demoId, fullDemo);
-    
-    // Log to console with formatting
-    console.log('\n' + '='.repeat(50));
-    console.log('🎯 NEW DEMO BOOKED - ' + demoId);
-    console.log('='.repeat(50));
-    console.log(`Restaurant: ${demoData.restaurantName}`);
-    console.log(`Owner: ${demoData.ownerName}`);
-    console.log(`Phone: ${demoData.phone}`);
-    console.log(`Email: ${demoData.email || 'Not provided'}`);
-    console.log(`Date/Time: ${demoData.datetime}`);
-    console.log(`Notes: ${demoData.notes || 'None'}`);
-    console.log('='.repeat(50) + '\n');
-    
-    return demoId;
-}
-// ============= END NOTIFICATION FUNCTIONS =============
-
-// Generate unique call ID
-function generateCallId() {
-    return Date.now().toString(36) + Math.random().toString(36).substr(2);
-}
-
-// Root route - health check
-fastify.get('/', async (request, reply) => {
-    reply.send({ message: 'Boostly AI SDR is running!' });
-});
-
-// Endpoint to view booked demos
-fastify.get('/demos', async (request, reply) => {
-    const demos = Array.from(bookedDemos.values());
-    reply.send({
-        count: demos.length,
-        demos: demos.sort((a, b) => new Date(b.bookedAt) - new Date(a.bookedAt))
+  if (!ADMIN_PHONE) return;
+  try {
+    await twilioClient.messages.create({
+      body: `New Demo: ${demoData.restaurantName} - ${demoData.ownerName} - ${demoData.datetime}`,
+      from: TWILIO_PHONE_NUMBER,
+      to: ADMIN_PHONE
     });
+    console.log('✅ SMS notification sent');
+  } catch (err) {
+    console.error('❌ Error sending SMS:', err);
+  }
+}
+
+async function storeDemoData(demoData) {
+  const demoId = `DEMO-${Date.now()}`;
+  const fullDemo = { id: demoId, ...demoData, bookedAt: new Date().toISOString(), status: 'scheduled' };
+  bookedDemos.set(demoId, fullDemo);
+  console.log('\n' + '='.repeat(50));
+  console.log('🎯 NEW DEMO BOOKED - ' + demoId);
+  console.log('='.repeat(50));
+  console.log(`Restaurant: ${demoData.restaurantName}`);
+  console.log(`Owner: ${demoData.ownerName}`);
+  console.log(`Phone: ${demoData.phone}`);
+  console.log(`Email: ${demoData.email || 'Not provided'}`);
+  console.log(`Date/Time: ${demoData.datetime}`);
+  console.log(`Notes: ${demoData.notes || 'None'}`);
+  console.log('='.repeat(50) + '\n');
+  return demoId;
+}
+
+function generateCallId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
+// ---------- Basic routes ----------
+fastify.get('/', async (_req, reply) => reply.send({ message: 'Boostly AI SDR is running!' }));
+
+fastify.get('/demos', async (_req, reply) => {
+  const demos = Array.from(bookedDemos.values());
+  reply.send({ count: demos.length, demos: demos.sort((a, b) => new Date(b.bookedAt) - new Date(a.bookedAt)) });
 });
 
-// Endpoint to trigger outbound calls
 fastify.post('/make-call', async (request, reply) => {
-    const { to, name, company, email } = request.body;
-    
-    if (!to || !name || !company) {
-        return reply.status(400).send({ 
-            error: 'Required: phone number (to), name, and company' 
-        });
-    }
-    
-    try {
-        const callId = generateCallId();
-
-        // Store lead data
-        activeCallSessions.set(callId, {
-            name,
-            company,
-            email: email || '',
-            phoneNumber: to
-        });
-
-        // Make the call
-        const call = await twilioClient.calls.create({
-            from: TWILIO_PHONE_NUMBER,
-            to: to,
-            url: `https://${request.headers.host}/outbound-answer?callId=${callId}`,
-            statusCallback: `https://${request.headers.host}/call-status?callId=${callId}`,
-            statusCallbackEvent: ['answered', 'completed', 'no-answer', 'busy'],
-            machineDetection: 'DetectMessageEnd',
-            asyncAmd: true,
-            timeout: 30
-        });
-
-        reply.send({
-            success: true,
-            callSid: call.sid,
-            message: `Calling ${name} at ${company}...`
-        });
-        
-    } catch (error) {
-        console.error('Error making call:', error);
-        reply.status(500).send({ error: 'Failed to initiate call: ' + error.message });
-    }
+  const { to, name, company, email } = request.body || {};
+  if (!to || !name || !company) {
+    return reply.status(400).send({ error: 'Required: phone number (to), name, and company' });
+  }
+  try {
+    const callId = generateCallId();
+    activeCallSessions.set(callId, { name, company, email: email || '', phoneNumber: to });
+    const call = await twilioClient.calls.create({
+      from: TWILIO_PHONE_NUMBER,
+      to,
+      url: `https://${request.headers.host}/outbound-answer?callId=${callId}`,
+      statusCallback: `https://${request.headers.host}/call-status?callId=${callId}`,
+      statusCallbackEvent: ['answered', 'completed', 'no-answer', 'busy'],
+      machineDetection: 'DetectMessageEnd',
+      asyncAmd: true,
+      timeout: 30
+    });
+    reply.send({ success: true, callSid: call.sid, message: `Calling ${name} at ${company}...` });
+  } catch (err) {
+    console.error('Error making call:', err);
+    reply.status(500).send({ error: 'Failed to initiate call: ' + err.message });
+  }
 });
 
-// Handle outbound call when answered
 fastify.all('/outbound-answer', async (request, reply) => {
-    const callId = request.query.callId;
-    const leadData = activeCallSessions.get(callId);
-    
-    // Check if it's an answering machine
-    const amdStatus = request.body?.AnsweredBy;
-    
-    if (amdStatus === 'machine_start' || amdStatus === 'fax' || amdStatus === 'machine_end_beep') {
-        // Just hang up on voicemail
-        const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-                      <Response>
-                          <Hangup/>
-                      </Response>`;
-        return reply.type('text/xml').send(twiml);
-    }
-    
-    // Human answered - connect to AI
-    const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
-                          <Response>
-                              <Connect>
-                                  <Stream url="wss://${request.headers.host}/media-stream?callId=${callId}" />
-                              </Connect>
-                          </Response>`;
-    
-    reply.type('text/xml').send(twimlResponse);
+  const callId = request.query.callId;
+  const amdStatus = request.body?.AnsweredBy;
+  if (amdStatus === 'machine_start' || amdStatus === 'fax' || amdStatus === 'machine_end_beep') {
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`;
+    return reply.type('text/xml').send(twiml);
+  }
+  const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="wss://${request.headers.host}/media-stream?callId=${callId}" />
+  </Connect>
+</Response>`;
+  reply.type('text/xml').send(twimlResponse);
 });
 
-// Handle call status updates
 fastify.post('/call-status', async (request, reply) => {
-    const { CallSid, CallStatus, CallDuration, To } = request.body;
-    const callId = request.query.callId;
-    const leadData = activeCallSessions.get(callId);
-    
-    console.log(`Call to ${leadData?.name} (${To}): ${CallStatus}`);
-    
-    if (CallStatus === 'completed' || CallStatus === 'no-answer' || CallStatus === 'busy') {
-        console.log(`Call Result - Name: ${leadData?.name}, Company: ${leadData?.company}, Status: ${CallStatus}, Duration: ${CallDuration}s`);
-        
-        
-        setTimeout(() => {
-            activeCallSessions.delete(callId);
-        }, 60000);
-    }
-    
-    reply.send({ received: true });
+  const { CallStatus, CallDuration, To } = request.body || {};
+  const callId = request.query.callId;
+  const leadData = activeCallSessions.get(callId);
+  console.log(`Call to ${leadData?.name} (${To}): ${CallStatus}`);
+  if (['completed', 'no-answer', 'busy'].includes(CallStatus)) {
+    console.log(`Call Result - Name: ${leadData?.name}, Company: ${leadData?.company}, Status: ${CallStatus}, Duration: ${CallDuration}s`);
+    setTimeout(() => activeCallSessions.delete(callId), 60_000);
+  }
+  reply.send({ received: true });
 });
 
-// ============= MCP CALENDAR ENDPOINTS =============
-// MCP endpoint to list available tools
-fastify.post('/mcp/list_tools', async (request, reply) => {
+// ---------- MCP calendar endpoints ----------
+const DEMO_SLOTS = {
+  monday: ["9:00 AM", "10:00 AM", "11:00 AM", "2:00 PM", "3:00 PM", "4:00 PM"],
+  tuesday: ["9:00 AM", "10:00 AM", "11:00 AM", "2:00 PM", "3:00 PM", "4:00 PM"],
+  wednesday: ["9:00 AM", "10:00 AM", "11:00 AM", "2:00 PM", "3:00 PM", "4:00 PM"],
+  thursday: ["9:00 AM", "10:00 AM", "11:00 AM", "2:00 PM", "3:00 PM", "4:00 PM"],
+  friday: ["9:00 AM", "10:00 AM", "11:00 AM", "2:00 PM", "3:00 PM"]
+};
+
+fastify.post('/mcp/list_tools', async () => ({
+  tools: [
+    {
+      name: "check_availability",
+      description: "Check available demo slots for a specific date",
+      parameters: {
+        type: "object",
+        properties: {
+          when: { type: "string", description: "Date to check: 'today', 'tomorrow', or day name" }
+        },
+        required: ["when"]
+      }
+    },
+    {
+      name: "book_demo",
+      description: "Book a demo appointment",
+      parameters: {
+        type: "object",
+        properties: {
+          restaurantName: { type: "string" },
+          ownerName: { type: "string" },
+          phone: { type: "string" },
+          email: { type: "string" },
+          datetime: { type: "string" },
+          notes: { type: "string" }
+        },
+        required: ["restaurantName", "ownerName", "phone", "datetime"]
+      }
+    }
+  ]
+}));
+
+fastify.post('/mcp/call_tool', async (request) => {
+  const { tool, arguments: args } = request.body || {};
+  if (tool === 'check_availability') {
+    let targetDate = new Date();
+
+    if (args.when === 'tomorrow') targetDate.setDate(targetDate.getDate() + 1);
+    else if (['monday', 'tuesday', 'wednesday', 'thursday', 'friday'].includes((args.when || '').toLowerCase())) {
+      const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+      const targetDay = days.indexOf(args.when.toLowerCase());
+      const currentDay = targetDate.getDay();
+      const daysUntilTarget = (targetDay - currentDay + 7) % 7 || 7;
+      targetDate.setDate(targetDate.getDate() + daysUntilTarget);
+    }
+
+    const dayName = new Intl.DateTimeFormat('en-US', { weekday: 'long' }).format(targetDate).toLowerCase();
+    const dateStr = targetDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+
+    if (dayName === 'saturday' || dayName === 'sunday') {
+      return { success: true, message: "No demos on weekends", slots: [] };
+    }
+
+    const allSlots = DEMO_SLOTS[dayName] || [];
+    const bookedForDate = [];
+    bookedDemos.forEach(demo => {
+      if (demo.datetime.includes(dateStr)) {
+        const time = demo.datetime.split(' at ')[1];
+        if (time) bookedForDate.push(time);
+      }
+    });
+
+    const available = allSlots.filter(slot => !bookedForDate.includes(slot));
     return {
-        tools: [
-            {
-                name: "check_availability",
-                description: "Check available demo slots for a specific date",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        when: { 
-                            type: "string", 
-                            description: "Date to check: 'today', 'tomorrow', or day name" 
-                        }
-                    },
-                    required: ["when"]
-                }
-            },
-            {
-                name: "book_demo",
-                description: "Book a demo appointment",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        restaurantName: { type: "string" },
-                        ownerName: { type: "string" },
-                        phone: { type: "string" },
-                        email: { type: "string" },
-                        datetime: { type: "string" },
-                        notes: { type: "string" }
-                    },
-                    required: ["restaurantName", "ownerName", "phone", "datetime"]
-                }
-            }
-        ]
+      success: true,
+      date: dateStr,
+      dayName: dayName.charAt(0).toUpperCase() + dayName.slice(1),
+      slots: available.map(time => ({ time, display: `${dateStr} at ${time}` }))
     };
+  }
+
+  if (tool === 'book_demo') {
+    const demoId = await storeDemoData(args);
+    await sendSlackNotification(args);
+    await sendSMS(args);
+    return {
+      success: true,
+      confirmationId: demoId,
+      message: `Demo confirmed for ${args.ownerName} from ${args.restaurantName}`,
+      datetime: args.datetime,
+      details: "Jakob will call at the scheduled time. Calendar invite coming shortly."
+    };
+  }
+
+  return { error: 'Unknown tool' };
 });
 
-// MCP endpoint to handle tool calls
-fastify.post('/mcp/call_tool', async (request, reply) => {
-    const { tool, arguments: args } = request.body;
-    
-    if (tool === 'check_availability') {
-        let targetDate = new Date();
-        
-        // Parse the when parameter
-        if (args.when === 'today') {
-            // Already set
-        } else if (args.when === 'tomorrow') {
-            targetDate.setDate(targetDate.getDate() + 1);
-        } else if (['monday', 'tuesday', 'wednesday', 'thursday', 'friday'].includes(args.when.toLowerCase())) {
-            // Find next occurrence of that day
-            const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-            const targetDay = days.indexOf(args.when.toLowerCase());
-            const currentDay = targetDate.getDay();
-            const daysUntilTarget = (targetDay - currentDay + 7) % 7 || 7;
-            targetDate.setDate(targetDate.getDate() + daysUntilTarget);
-        }
-        
-        const dayName = targetDate.toLocaleLowerCase('en-US', { weekday: 'long' });
-        const dateStr = targetDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-        
-        // Skip weekends
-        if (dayName === 'saturday' || dayName === 'sunday') {
-            return {
-                success: true,
-                message: "No demos on weekends",
-                slots: []
-            };
-        }
-        
-        const allSlots = DEMO_SLOTS[dayName] || [];
-        const bookedKey = targetDate.toISOString().split('T')[0];
-        
-        // Get already booked slots for this date
-        const bookedForDate = [];
-        bookedDemos.forEach(demo => {
-            if (demo.datetime.includes(dateStr)) {
-                const time = demo.datetime.split(' at ')[1];
-                if (time) bookedForDate.push(time);
-            }
-        });
-        
-        const available = allSlots.filter(slot => !bookedForDate.includes(slot));
-        
-        return {
-            success: true,
-            date: dateStr,
-            dayName: dayName.charAt(0).toUpperCase() + dayName.slice(1),
-            slots: available.map(time => ({
-                time,
-                display: `${dateStr} at ${time}`
-            }))
-        };
-    }
-    
-    if (tool === 'book_demo') {
-        // Store the demo data
-        const demoId = await storeDemoData(args);
-        
-        // Send notifications
-        await sendSlackNotification(args);
-        
-        // Optionally send SMS
-        if (process.env.ADMIN_PHONE) {
-            await sendSMS(args);
-        }
-        
-        return {
-            success: true,
-            confirmationId: demoId,
-            message: `Demo confirmed for ${args.ownerName} from ${args.restaurantName}`,
-            datetime: args.datetime,
-            details: "Jakob will call at the scheduled time. Calendar invite coming shortly."
-        };
-    }
-    
-    return { error: 'Unknown tool' };
-});
-// ============= END MCP CALENDAR ENDPOINTS =============
+// ---------- Media Stream bridge (Twilio <-> OpenAI Realtime) ----------
+fastify.register(async (fastifyInstance) => {
+  fastifyInstance.get('/media-stream', { websocket: true }, (connection, req) => {
+    const callId = req.query.callId;
+    const leadData = activeCallSessions.get(callId);
+    console.log(`Connected to ${leadData?.name} at ${leadData?.company}`);
 
-// WebSocket for media streaming
-fastify.register(async (fastify) => {
-    fastify.get('/media-stream', { websocket: true }, (connection, req) => {
-        const callId = req.query.callId;
-        const leadData = activeCallSessions.get(callId);
-        
-        console.log(`Connected to ${leadData?.name} at ${leadData?.company}`);
-        
-        // Connect to OpenAI - following Twilio's exact format
-        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=0.8', {
-            headers: {
-                Authorization: `Bearer ${OPENAI_API_KEY}`,
-            }
-        });
-        
-        let streamSid = null;
-        
-        // Create Kora's personality and instructions - following Twilio's exact format
-        const sendSessionUpdate = () => {
-            const sessionUpdate = {
-                type: 'session.update',
-                session: {
-                    type: 'realtime',
-                    model: 'gpt-realtime',
-                    output_modalities: ['audio'],
-                    audio: {
-                        input: {
-                            format: { type: 'audio/pcmu' },
-                            turn_detection: { type: 'server_vad' }
-                        },
-                        output: {
-                            format: { type: 'audio/pcmu' },
-                            voice: 'alloy'
-                        },
-                    },
-                    instructions: `You are Kora, Boostly's friendly marketing consultant. You're calling ${leadData?.name} from ${leadData?.company} who recently filled out a form on Facebook about restaurant marketing.
+    // Connect to OpenAI Realtime
+    const openAiWs = new WebSocket(
+      'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'OpenAI-Beta': 'realtime=v1'
+        }
+      }
+    );
+
+    let streamSid = null;
+    let lastCommitTs = 0;
+
+    const sendSessionUpdate = () => {
+      const sessionUpdate = {
+        type: 'session.update',
+        session: {
+          modalities: ['audio'],
+          voice: VOICE,
+          input_audio_format: 'g711_ulaw',   // Twilio μ-law 8kHz
+          output_audio_format: 'g711_ulaw',  // Back to Twilio as μ-law
+          turn_detection: { type: 'server_vad' },
+          temperature: 0.8,
+          instructions: `You are Kora, Boostly's friendly marketing consultant. You're calling ${leadData?.name} from ${leadData?.company} who recently filled out a form on Facebook about restaurant marketing.
 
 PERSONALITY:
 - Be super casual and conversational, like talking to a friend
@@ -519,155 +379,137 @@ IMPORTANT RULES:
 - Website: Boostly.com
 
 Remember: Be conversational and natural! Let them talk!`
-                }
-            };
+        }
+      };
+      openAiWs.send(JSON.stringify(sessionUpdate));
+    };
 
-            console.log('Sending session configuration to OpenAI...');
-            openAiWs.send(JSON.stringify(sessionUpdate));
-        };
-        
-        // OpenAI WebSocket opened - follow Twilio's example with delay
-        openAiWs.on('open', () => {
-            console.log('Connected to the OpenAI Realtime API');
-            setTimeout(() => {
-                sendSessionUpdate();
+    // ---- OpenAI events ----
+    openAiWs.on('open', () => {
+      console.log('Connected to the OpenAI Realtime API');
+      // Configure session
+      sendSessionUpdate();
 
-                // After session is configured, trigger the AI to start speaking
-                setTimeout(() => {
-                    console.log('Triggering AI to start conversation...');
-                    // Send a conversation item to prompt the AI to speak first
-                    const conversationItem = {
-                        type: 'conversation.item.create',
-                        item: {
-                            type: 'message',
-                            role: 'system',
-                            content: [
-                                {
-                                    type: 'input_text',
-                                    text: 'Start the conversation by greeting the customer according to your instructions.'
-                                }
-                            ]
-                        }
-                    };
-                    openAiWs.send(JSON.stringify(conversationItem));
-
-                    // Then create a response
-                    setTimeout(() => {
-                        const createResponse = {
-                            type: 'response.create'
-                        };
-                        openAiWs.send(JSON.stringify(createResponse));
-                        console.log('Response creation triggered');
-                    }, 100);
-                }, 500);
-            }, 250);
-        });
-        
-        // Handle OpenAI responses - as per OpenAI docs
-        openAiWs.on('message', function incoming(message) {
-            try {
-                const response = JSON.parse(message.toString());
-
-                // Log all events for debugging
-                if (!['input_audio_buffer.speech_started', 'input_audio_buffer.speech_stopped'].includes(response.type)) {
-                    console.log('OpenAI event:', response.type);
-                }
-
-                // Log important message types
-                if (response.type === 'session.created') {
-                    console.log('✅ Session created');
-                }
-                if (response.type === 'session.updated') {
-                    console.log('Session updated successfully:', response);
-                }
-                if (response.type === 'response.created') {
-                    console.log('🎤 AI starting to generate response');
-                }
-                if (response.type === 'response.audio.transcript.delta') {
-                    console.log('📝 AI saying:', response.delta);
-                }
-
-                // Handle audio response from OpenAI - EXACTLY as Twilio docs show
-                if (response.type === 'response.output_audio.delta' && response.delta) {
-                    // Log occasionally to confirm audio is being sent
-                    if (Math.random() < 0.1) {
-                        console.log('📤 Sending audio to phone');
-                    }
-
-                    const audioDelta = {
-                        event: 'media',
-                        streamSid: streamSid,
-                        media: {
-                            payload: Buffer.from(response.delta, 'base64').toString('base64')
-                        }
-                    };
-                    connection.socket.send(JSON.stringify(audioDelta));
-                }
-
-                if (response.type === 'error') {
-                    console.error('❌ OpenAI Error:', response.error);
-                }
-                
-            } catch (error) {
-                console.error('Error processing OpenAI message:', error);
-            }
-        });
-        
-        // Handle incoming audio from Twilio
-        connection.on('message', (message) => {
-            try {
-                const data = JSON.parse(message);
-                
-                switch (data.event) {
-                    case 'media':
-                        if (openAiWs.readyState === WebSocket.OPEN) {
-                            const audioAppend = {
-                                type: 'input_audio_buffer.append',
-                                audio: data.media.payload
-                            };
-                            openAiWs.send(JSON.stringify(audioAppend));
-                        }
-                        break;
-                        
-                    case 'start':
-                        streamSid = data.start.streamSid;
-                        console.log('Call started, stream ID:', streamSid);
-                        console.log('Media format:', data.start.mediaFormat);
-                        break;
-                }
-            } catch (error) {
-                console.error('Error parsing Twilio message:', error);
-            }
-        });
-        
-        // Handle disconnection
-        connection.on('close', () => {
-            if (openAiWs.readyState === WebSocket.OPEN) {
-                openAiWs.close();
-            }
-            console.log(`Call with ${leadData?.name} ended`);
-        });
-        
-        openAiWs.on('close', () => {
-            console.log('Disconnected from OpenAI');
-        });
-        
-        openAiWs.on('error', (error) => {
-            console.error('OpenAI WebSocket error:', error);
-        });
+      // Kick-off: create a greeting
+      const kickoff = {
+        type: 'conversation.item.create',
+        item: {
+          type: 'message',
+          role: 'system',
+          content: [{ type: 'input_text', text: 'Start the conversation with a friendly greeting.' }]
+        }
+      };
+      openAiWs.send(JSON.stringify(kickoff));
+      openAiWs.send(JSON.stringify({ type: 'response.create' }));
     });
+
+    openAiWs.on('message', (msg) => {
+      let response;
+      try { response = JSON.parse(msg); } catch { return; }
+
+      if (['session.created', 'session.updated', 'response.created', 'response.output_audio.delta', 'input_audio_buffer.speech_started', 'input_audio_buffer.speech_stopped', 'response.done', 'error'].includes(response.type)) {
+        // keep logs lightweight
+        if (response.type !== 'response.output_audio.delta') {
+          console.log('OpenAI event:', response.type);
+        }
+      }
+
+      // Forward model audio to Twilio (already base64 μ-law)
+      if (response.type === 'response.output_audio.delta' && response.delta && streamSid) {
+        const audioDelta = { event: 'media', streamSid, media: { payload: response.delta } };
+        try { connection.socket.send(JSON.stringify(audioDelta)); } catch (e) { console.error('Send to Twilio failed:', e); }
+      }
+
+      // If VAD says user stopped speaking, ask model to respond
+      if (response.type === 'input_audio_buffer.speech_stopped') {
+        openAiWs.send(JSON.stringify({ type: 'response.create' }));
+      }
+
+      // Log model errors
+      if (response.type === 'error') {
+        console.error('❌ OpenAI Error:', response.error || response);
+      }
+    });
+
+    openAiWs.on('close', () => console.log('Disconnected from OpenAI'));
+    openAiWs.on('error', (err) => console.error('OpenAI WebSocket error:', err));
+
+    // Simple keepalive for OpenAI WS
+    const oaPing = setInterval(() => {
+      if (openAiWs.readyState === WebSocket.OPEN) {
+        openAiWs.ping();
+      }
+    }, 20_000);
+
+    // ---- Twilio stream events ----
+    connection.on('message', (raw) => {
+      let data;
+      try { data = JSON.parse(raw); } catch { return; }
+
+      switch (data.event) {
+        case 'start': {
+          streamSid = data.start?.streamSid;
+          console.log('Twilio stream started. streamSid:', streamSid, 'format:', data.start?.mediaFormat);
+          break;
+        }
+        case 'media': {
+          // Append inbound μ-law audio to OpenAI buffer (payload is base64)
+          if (openAiWs.readyState === WebSocket.OPEN && data.media?.payload) {
+            openAiWs.send(JSON.stringify({
+              type: 'input_audio_buffer.append',
+              audio: data.media.payload
+            }));
+
+            // Commit periodically (~300ms) so the model processes frames
+            const now = Date.now();
+            if (now - lastCommitTs > 300) {
+              openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+              lastCommitTs = now;
+            }
+          }
+          break;
+        }
+        case 'stop': {
+          // Stream ended; finalize buffer and request a response
+          if (openAiWs.readyState === WebSocket.OPEN) {
+            openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+            openAiWs.send(JSON.stringify({ type: 'response.create' }));
+          }
+          break;
+        }
+        case 'mark':
+        default:
+          // ignore
+          break;
+      }
+    });
+
+    connection.on('close', () => {
+      clearInterval(oaPing);
+      try { if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close(); } catch {}
+      console.log(`Call with ${leadData?.name || 'Unknown'} ended`);
+    });
+
+    // Keepalive Twilio side (send ping frames)
+    const twilioPing = setInterval(() => {
+      try { connection.socket.ping(); } catch {}
+    }, 25_000);
+
+    connection.socket.on('close', () => clearInterval(twilioPing));
+    connection.socket.on('error', (e) => console.error('Twilio WS error:', e));
+  });
 });
 
-// Start server
-fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
-    if (err) {
-        console.error(err);
-        process.exit(1);
-    }
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`Boostly AI SDR running on port ${PORT}`);
-    console.log(`MCP Calendar endpoints available at /mcp/*`);
-    console.log(`View booked demos at /demos`);
-    console.log(`Slack notifications: ${SLACK_WEBHOOK_URL ? '✅ Configured' : '❌ Not configured'}`);
-    console.log(`${'='.repeat(60)}\n`);
+// ---------- Start server ----------
+fastify.listen({ port: Number(PORT), host: '0.0.0.0' }, (err, address) => {
+  if (err) {
+    console.error(err);
+    process.exit(1);
+  }
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`Boostly AI SDR running at ${address}`);
+  console.log(`MCP Calendar endpoints available at /mcp/*`);
+  console.log(`View booked demos at /demos`);
+  console.log(`Slack notifications: ${SLACK_WEBHOOK_URL ? '✅ Configured' : '❌ Not configured'}`);
+  console.log(`${'='.repeat(60)}\n`);
 });
