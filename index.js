@@ -529,7 +529,18 @@ Remember: Be conversational and natural! Let them talk!`
         // OpenAI WebSocket opened - follow Twilio's example with delay
         openAiWs.on('open', () => {
             console.log('Connected to the OpenAI Realtime API');
-            setTimeout(sendSessionUpdate, 250); // Ensure connection stability
+            setTimeout(() => {
+                sendSessionUpdate();
+
+                // After session is configured, trigger the AI to start speaking
+                setTimeout(() => {
+                    console.log('Triggering AI to start conversation...');
+                    const inputAudioBuffer = {
+                        type: 'input_audio_buffer.commit'
+                    };
+                    openAiWs.send(JSON.stringify(inputAudioBuffer));
+                }, 500);
+            }, 250);
         });
         
         // Handle OpenAI responses - as per OpenAI docs
@@ -537,8 +548,10 @@ Remember: Be conversational and natural! Let them talk!`
             try {
                 const response = JSON.parse(message.toString());
 
-                // Log message type for debugging
-                console.log('OpenAI event:', response.type);
+                // Log all events for debugging
+                if (!['input_audio_buffer.speech_started', 'input_audio_buffer.speech_stopped'].includes(response.type)) {
+                    console.log('OpenAI event:', response.type);
+                }
 
                 // Log important message types
                 if (response.type === 'session.created') {
@@ -556,6 +569,11 @@ Remember: Be conversational and natural! Let them talk!`
 
                 // Handle audio response from OpenAI - EXACTLY as Twilio docs show
                 if (response.type === 'response.output_audio.delta' && response.delta) {
+                    // Log occasionally to confirm audio is being sent
+                    if (Math.random() < 0.1) {
+                        console.log('📤 Sending audio to phone');
+                    }
+
                     const audioDelta = {
                         event: 'media',
                         streamSid: streamSid,
